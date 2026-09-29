@@ -48,9 +48,7 @@ class ReasoningAgent:
             self.logger.error(f"Error solving problem {idx}: {e}")
             return {
                 "final_response": "解题过程中出现错误，无法给出完整答案。",
-                # 评测 trace 只保留结构化摘要，不回传异常正文或本机路径。
-                "trace": [{"step": "error", "error_type": type(e).__name__,
-                           "idx": idx}],
+                "trace": [{"step": "error", "content": str(e), "idx": idx}],
             }
 
     def _build_trace(self, state: dict) -> list:
@@ -141,7 +139,7 @@ class ReasoningAgent:
                     "validation_points_count": len(rr.get("validation_points", [])),
                     "answer_source": rr.get("answer_source", "parsed_sections"),
                 },
-                # 只记录解析后的有限输出，不暴露原始响应。
+                # 记录解析后的推理输出，便于本地核对。
                 "output": self._structured_reasoning_output(rr),
                 "tools": [
                     {
@@ -355,54 +353,30 @@ class ReasoningAgent:
 
     @staticmethod
     def _structured_attempts(items: Any) -> list:
-        """只保留公开的状态计数，移除模型原文、答案和验证正文。"""
+        """保留各阶段的完整尝试记录，便于本地诊断。"""
         if not isinstance(items, list):
             return []
-        allowed = {
-            "attempt", "round", "status", "action", "objective", "prefill",
-            "candidate_count", "selected_source", "response_chars", "code_length",
-            "execution_time", "reason", "note",
-        }
-        result = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            safe = {}
-            for key, value in item.items():
-                if key not in allowed:
-                    continue
-                if key in {"reason", "note"}:
-                    # 仅保留有限的状态说明，不保存异常正文或模型输出。
-                    safe[key] = ReasoningAgent._truncate(value, 120)
-                else:
-                    safe[key] = value if isinstance(value, (bool, int, float, str)) else str(value)
-            result.append(safe)
-        return result
+        return items
 
     def _structured_reasoning_output(self, result: Any) -> dict:
-        """输出推理统计，不记录分析正文、步骤、答案或验证文本。"""
+        """保留解析后的推理内容，便于核对 Agent 实际输出。"""
         if not isinstance(result, dict):
             return {}
         return {
-            "analysis_chars": len(str(result.get("analysis") or "")),
-            "steps_count": len(result.get("steps") or []),
-            "validation_points_count": len(result.get("validation_points") or []),
-            "answer_present": bool(str(result.get("answer") or "").strip()),
+            "analysis": result.get("analysis", ""),
+            "steps": result.get("steps", []),
+            "answer": result.get("answer", ""),
+            "validation_points": result.get("validation_points", []),
             "answer_source": result.get("answer_source", "parsed_sections"),
+            "raw_response_excerpt": self._excerpt(
+                result.get("raw_response", "")),
         }
 
     def _structured_python_output(self, output: Any) -> dict:
-        """输出验证状态统计，不记录答案、代码或验证正文。"""
+        """保留 Python 验证结果，便于核对独立求解过程。"""
         if not isinstance(output, dict):
             return {}
-        return {
-            "success": bool(output.get("success", False)),
-            "evidence_status": output.get("evidence_status", ""),
-            "evidence_chars": len(str(output.get("evidence_summary") or "")),
-            "contradiction_count": len(output.get("contradictions") or []),
-            "execution_backend": output.get("execution_backend", ""),
-            "objective_independent": bool(output.get("objective_independent", False)),
-        }
+        return dict(output)
 
     @staticmethod
     def _excerpt(value: str, head: int = 600, tail: int = 1400) -> str:
