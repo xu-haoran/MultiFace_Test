@@ -1,8 +1,9 @@
 """题库参考示例区块的唯一构造入口。
 
 推理节点与 Python 节点各自内联拼装过同一段文本，两份实现的截断长度不同、
-措辞也会各自漂移。检索条数（`db_retrieval_top_k`）与注入契约"两条全部同时进
-两个子代理"必须在一处可验证，故收敛到这里；调用方只保留各自的截断额度。
+措辞也会各自漂移。检索关系和注入数量由检索节点统一决定：高相似度最多 1 条，
+没有高相似度时相关题型最多 3 条；本模块只负责把已筛选的记录按安全规则格式化，
+调用方只保留各自的截断额度。
 
 2026-08-20：区块必须自带**反锚定**说明。检索是向量近邻，命中的常常是"看起来
 几乎一样、答案却不同"的近似题，而这正是评测中最贵的一类失分：
@@ -30,15 +31,15 @@ _KNOWLEDGE_HEADER = "\n\n本科数学知识卡（项目内学科手册提炼）�
 #: 反锚定说明。放在示例**之前**——写在后面时模型往往已经先读完解答并锚定了结论。
 _ANTI_ANCHOR_NOTE = """
 ⚠️ 这些记录由向量检索召回。标为“高相似度直供”的记录表示**检索相似度**严格
-大于 0.88，题目与完整解答会直接提供给代理。其余都是近似题，不能直接搬用结论。
+大于 0.85，题目与完整解答会直接提供给代理。其余都是近似题，不能直接搬用结论。
 使用规则：
 
-以下逐项核对规则只约束标为“结构模板”的记录；高相似度直供记录遵循
+以下逐项核对规则只约束标为“相关题型/方法参考”的记录；高相似度直供记录遵循
 其独立的使用边界。
 
 1. 先逐项核对差异：参数数值（个数/上界/模数）、**奇偶性**、谁做选择、目标是
    最大化还是最小化、约束方向（≤ 还是 <、"所有解"还是"一个解"）。
-2. 对“结构模板”记录，只要有一项不同，示例的**结论就不可迁移**——
+2. 对“相关题型/方法参考”记录，只要有一项不同，示例的**结论就不可迁移**——
    此时最多借用它的**方法**，并且必须在本题自己的参数下从头重算，再代回题面验证。
 3. 对这些低置信度记录若不能确认两题严格同构，就完全忽略示例，独立求解。宁可自己算，
    也不要抄一个参数不同的结论。
@@ -86,7 +87,7 @@ def _numeric_diff_line(problem: str, example_problem: str) -> str:
 def _method_only_solution(solution: str, limit: int) -> str:
     """Keep procedural guidance while masking answer-bearing literals.
 
-    Related/template records are retrieved for ideas, not as answer keys.  In
+    Related records are retrieved for ideas, not as answer keys.  In
     addition to the prose warning, remove explicit answer lines and mask numeric
     constants so a model cannot simply copy a nearby result.
     """
@@ -108,7 +109,7 @@ def build_reference_block(
     """把检索到的每一条相似题拼成参考区块；无检索结果时返回空串。
 
     Args:
-        examples: `retrieved_examples`，按相似度降序。全部注入，不再二次筛选。
+        examples: 检索节点已按关系和注入上限筛选的 `retrieved_examples`，按相似度降序。
         problem_chars: 每条题面的截断长度。
         solution_chars: 每条解答的截断长度。
         problem: 本题题面。给出时逐条附上与示例的规模参数差异（反锚定）。
@@ -127,8 +128,8 @@ def build_reference_block(
         dataset = str(example.get("source_dataset") or "olympiad")
         solution_type = str(example.get("solution_type") or "worked_solution")
         relation_label = {
-            "high_similarity": "高相似度直供（检索相似度 >0.88）",
-            "template": "结构模板相同但参数有变化",
+            "high_similarity": "高相似度直供（检索相似度 >0.85）",
+            "related": "相关题型/方法参考（0.60 < 检索相似度 ≤ 0.85）",
         }.get(relation, "关系未确认")
         parts.append(
             f"\n### 示例 {i}（关系: {relation_label}；相似度: {similarity:.3f}；"
@@ -136,12 +137,12 @@ def build_reference_block(
         )
         if relation == "high_similarity":
             parts.append(
-                "**使用边界**：这是检索相似度严格大于 0.88 的高置信度直供记录。"
-                "题面和原始解答完整提供给代理，直接作为本题参考；此分支不再做模板、"
-                "参数或字符串模糊处理。请优先沿用解答中的结论与表达，若题面本身出现"
+                "**使用边界**：这是检索相似度严格大于 0.85 的高置信度直供记录。"
+                "题面和原始解答完整提供给代理，直接作为本题参考；此分支不再做相关题的"
+                "参数屏蔽或字符串模糊处理。请优先沿用解答中的结论与表达，若题面本身出现"
                 "可见冲突，再回到本题条件核对。\n"
             )
-        elif relation == "template":
+        elif relation == "related":
             changes = example.get("changed_parameters") or []
             parts.append(
                 "**使用边界**：只学习建模与推导方法。参考题答案绝不能直接作为本题答案，"

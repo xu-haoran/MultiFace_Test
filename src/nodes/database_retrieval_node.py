@@ -24,10 +24,12 @@ _RETRIEVAL_DB_LOCK = threading.RLock()
 def database_retrieval_node(state: Dict[str, Any], config: Dict) -> Dict[str, Any]:
     """Query ChromaDB for the top-k similar problems+solutions as reference examples.
 
-    k comes from ``CONFIG["db_retrieval_top_k"]`` (2). A retrieval similarity
-    strictly above ``CONFIG["db_high_similarity"]`` is injected with its
-    complete problem and solution; lower-similarity records follow the relation
-    filters. Injected examples are shared by the reasoning and Python agents.
+    The retriever recalls a larger candidate set, then applies three relation
+    bands. A retrieval similarity strictly above
+    ``CONFIG["db_high_similarity"]`` is injected with its complete problem and
+    solution (at most one); related records are method-only references (at most
+    ``db_related_inject_k``), and irrelevant records remain trace-only. The
+    selected examples are shared by the reasoning and Python agents.
 
     Returns:
         Dict with 'retrieved_examples': List[Dict] containing:
@@ -87,12 +89,12 @@ def database_retrieval_node(state: Dict[str, Any], config: Dict) -> Dict[str, An
         candidates = annotate_candidates(
             problem,
             raw_results,
-            high_similarity_min=float(CONFIG.get("db_high_similarity", 0.88)),
-            template_min_similarity=float(CONFIG.get("db_template_similarity", 0.70)),
+            high_similarity_min=float(CONFIG.get("db_high_similarity", 0.85)),
+            related_min_similarity=float(CONFIG.get("db_related_similarity", 0.60)),
         )
         examples = select_for_injection(
             candidates,
-            template_limit=int(CONFIG.get("db_template_inject_k", 3) or 3),
+            related_limit=int(CONFIG.get("db_related_inject_k", 3) or 3),
         )
         for i, r in enumerate(candidates):
             logger.info(
@@ -104,7 +106,7 @@ def database_retrieval_node(state: Dict[str, Any], config: Dict) -> Dict[str, An
         # 不锁定答案；关系标签只用于安全筛选和 trace。
         relation_counts = {
             name: sum(1 for item in candidates if item.get("relation") == name)
-            for name in ("high_similarity", "template", "irrelevant")
+            for name in ("high_similarity", "related", "irrelevant")
         }
         logger.info(
             f"[db_retrieval] recalled={len(candidates)} injected={len(examples)} "

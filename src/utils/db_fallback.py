@@ -28,7 +28,7 @@ _ANSWER_PATTERNS = (
 #: 低于此相似度的检索结果不足以支撑兜底——宁可给通用失败说明。
 MIN_SIMILARITY = 0.45
 
-HIGH_SIMILARITY_ANSWER_MIN = 0.88
+HIGH_SIMILARITY_ANSWER_MIN = 0.85
 
 
 #: 结论值之后常接的论证连接词——"The answer is 1/2 by pigeonhole" 里的 " by ..."

@@ -1,9 +1,9 @@
 """Relation labels for retrieved mathematics problems.
 
 All relation tiers are determined by the retrieval score supplied by the
-database layer.  A strict ``>0.88`` gate marks a high-similarity record whose
+database layer.  A strict ``>0.85`` gate marks a high-similarity record whose
 full problem and solution may be shown to the solver; lower score bands are
-template or irrelevant. Text normalization is retained only for
+related or irrelevant. Text normalization is retained only for
 diagnostic parameter/qualifier annotations, never for tier selection.
 """
 
@@ -108,10 +108,10 @@ def classify_relation(
     candidate_problem: str,
     similarity: float,
     *,
-    high_similarity_min: float = 0.88,
-    template_min_similarity: float = 0.70,
+    high_similarity_min: float = 0.85,
+    related_min_similarity: float = 0.60,
 ) -> Dict[str, Any]:
-    """Return high_similarity/template/irrelevant with evidence.
+    """Return high_similarity/related/irrelevant with evidence.
 
     Every relation decision uses only ``similarity``.  Text-normalized
     parameter/qualifier annotations are diagnostic context and do not override
@@ -130,17 +130,17 @@ def classify_relation(
 
     changed = _changed_parameters(problem, candidate_problem)
     critical_mismatch = sorted(_critical_signature(problem) ^ _critical_signature(candidate_problem))
-    if score > template_min_similarity:
+    if score > float(related_min_similarity):
         return {
-            "relation": "template",
-            "relation_reason": "retrieval_similarity_in_template_band",
+            "relation": "related",
+            "relation_reason": "retrieval_similarity_in_related_band",
             "changed_parameters": changed,
             "changed_qualifiers": critical_mismatch,
         }
 
     return {
         "relation": "irrelevant",
-        "relation_reason": "retrieval_similarity_at_or_below_template_threshold",
+        "relation_reason": "retrieval_similarity_at_or_below_related_threshold",
         "changed_parameters": changed,
         "changed_qualifiers": critical_mismatch,
     }
@@ -150,8 +150,8 @@ def annotate_candidates(
     problem: str,
     candidates: Iterable[Dict[str, Any]],
     *,
-    high_similarity_min: float = 0.88,
-    template_min_similarity: float = 0.70,
+    high_similarity_min: float = 0.85,
+    related_min_similarity: float = 0.60,
 ) -> list[Dict[str, Any]]:
     annotated = []
     for raw in candidates:
@@ -161,9 +161,9 @@ def annotate_candidates(
             item.get("problem", ""),
             item.get("similarity", 0.0),
             high_similarity_min=high_similarity_min,
-            template_min_similarity=template_min_similarity,
+            related_min_similarity=related_min_similarity,
         ))
-        # 只有高相似记录可提供解答正文；模板题仅作方法提示。
+        # 只有高相似记录可提供解答正文；相关题仅作方法提示。
         item["answer_safe"] = item.get("relation") == "high_similarity"
         annotated.append(item)
     return annotated
@@ -172,15 +172,15 @@ def annotate_candidates(
 def select_for_injection(
     candidates: Iterable[Dict[str, Any]],
     *,
-    template_limit: int = 3,
+    related_limit: int = 3,
 ) -> list[Dict[str, Any]]:
     """Keep a small, relation-aware context after broad retrieval."""
     values = list(candidates)
     high_similarity = [item for item in values if item.get("relation") == "high_similarity"]
     if high_similarity:
         return high_similarity[:1]
-    template = [item for item in values if item.get("relation") == "template"]
-    if template and template_limit > 0:
-        return template[:max(1, template_limit)]
+    related = [item for item in values if item.get("relation") == "related"]
+    if related and related_limit > 0:
+        return related[:max(1, related_limit)]
     return []
 

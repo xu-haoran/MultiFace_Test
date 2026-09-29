@@ -82,7 +82,7 @@ class KnowledgeCardRetriever:
         """Use the separately persisted card collection when it is available.
 
         The collection is deliberately separate from answer-bearing problems, so
-        its records can never enter the high-similarity/template answer path.
+        its records can never enter the high-similarity/related answer path.
         """
         if self.db_client is None:
             return []

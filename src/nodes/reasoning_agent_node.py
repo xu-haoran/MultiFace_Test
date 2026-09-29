@@ -451,8 +451,8 @@ def reasoning_agent_node(state, config):
         if excerpt:
             alternate_skill_parts.append(f"\n[备选学科：{alternate}]\n{excerpt}")
 
-    # 题库参考示例：检索到的每一条都注入，不在此二次筛选（条数由
-    # CONFIG["db_retrieval_top_k"] 决定，与 Python 节点收到的是同一批）。
+    # 题库参考示例：检索节点已按相似度关系和注入上限筛选；这里不再二次筛选，
+    # 与 Python 节点收到的是同一批。
     examples_text = _reference_examples_block(state.get("retrieved_examples"), problem)
     cards_text = _knowledge_cards_block(state.get("knowledge_cards"))
     high_similarity_context = any(
@@ -472,8 +472,8 @@ def reasoning_agent_node(state, config):
     base_prompt += structure_instruction(problem)
     if high_similarity_context:
         base_prompt += (
-            "\n\n[高相似度直供参考优先] 检索区块中检索相似度严格大于 0.88 的记录已直接"
-            "提供题面和原始解答，不再经过模板、参数或字符串模糊处理。优先沿用该解答的"
+            "\n\n[高相似度直供参考优先] 检索区块中检索相似度严格大于 0.85 的记录已直接"
+            "提供题面和原始解答，不再进行相关题的参数屏蔽或字符串模糊处理。优先沿用该解答的"
             "结论、数学对象和表达结构；若题面出现可见冲突，再按本题条件核对。\n"
         )
     # 压缩重试要压的是推导篇幅，不是答案该覆盖的分支（评委复测 idx 14）。

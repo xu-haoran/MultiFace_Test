@@ -13,7 +13,6 @@ from utils.conclusion_salvage import salvage_conclusion
 from utils.db_fallback import (
     MIN_SIMILARITY as DB_MIN_SIMILARITY,
     db_fallback_response,
-    extract_reference_conclusion,
 )
 from utils.cot_stripper import is_placeholder_answer, strip_cot_prefix
 from utils.answer_extractor import looks_incomplete_answer
@@ -21,7 +20,7 @@ from utils.llm_retry import chat_prefilled, chat_with_retry
 from utils.prompt_templates import COORDINATOR_PROMPT
 from utils.token_budget import estimate_tokens
 from utils.verification_evidence import python_answer_is_trusted
-from utils.reference_block import build_reference_block
+from utils.reference_block import build_reference_block, _method_only_solution
 from config import CONFIG
 from utils.problem_profile import (
     fill_answer_matches_blanks,
@@ -122,7 +121,10 @@ def _database_reference_block(state: dict, limit: int = 2) -> str:
             similarity = 0.0
         if similarity < DB_MIN_SIMILARITY:
             continue
-        high_similarity = str(example.get("relation") or "") == "high_similarity"
+        relation = str(example.get("relation") or "")
+        if relation == "irrelevant":
+            continue
+        high_similarity = relation == "high_similarity"
         if high_similarity:
             lines.append(
                 f"\n[题库高相似度直供 检索相似度{similarity:.3f}]\n"
@@ -130,17 +132,16 @@ def _database_reference_block(state: dict, limit: int = 2) -> str:
                 f"完整解答：{str(example.get('solution') or '')[:1200]}\n"
             )
             continue
-        conclusion = extract_reference_conclusion(example.get("solution", ""))
         entry = (f"\n[题库相似题 相似度{similarity:.3f}]\n"
                  f"题面：{str(example.get('problem') or '')[:600]}\n")
-        if conclusion:
-            entry += f"该题结论：{conclusion}\n"
-        else:
-            entry += f"解答节选：{str(example.get('solution') or '')[:600]}\n"
+        entry += (
+            "仅提供题型/方法参考；具体结论、答案和数值已隐藏：\n"
+            f"{_method_only_solution(str(example.get('solution') or ''), 600)}\n"
+        )
         lines.append(entry)
     if not lines:
         return ""
-    return ("\n题库检索到的题目与解答参考（检索相似度严格 >0.88 的高相似度记录直接提供；"
+    return ("\n题库检索到的题目与解答参考（检索相似度严格 >0.85 的高相似度记录直接提供；"
             "其余记录仅作近似题方法参考）：\n" + "".join(lines))
 
 
@@ -470,7 +471,7 @@ def coordinator_node(state, config):
         if high_similarity_examples:
             example = high_similarity_examples[0]
             review_prompt = (
-                "请作为高相似度教材解的最终复核者。下面的参考解来自检索相似度严格大于 0.88 的"
+                "请作为高相似度教材解的最终复核者。下面的参考解来自检索相似度严格大于 0.85 的"
                 "普通工作示例，不是标准答案字段。逐项核对题面和参考解的关键条件；若候选"
                 "与参考解或题面冲突，改为你复核后的结论。只输出一行‘最终答案：...’，"
                 "不要解释，不要输出标准答案、答案字段或内部推理。\n"

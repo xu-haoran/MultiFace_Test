@@ -1,6 +1,7 @@
 from typing import Any, Dict
 
 from agent.langgraph_math_agent import MathAgentGraph
+from config import CONFIG
 from utils.skills_loader import SkillsLoader
 from utils.python_mcp_client import PythonMCPClient
 from utils.token_budget import TokenBudget
@@ -73,13 +74,23 @@ class ReasoningAgent:
         # 2026-08-19 之前这一步完全不在 trace 里，只能从 node_timings 的
         # database_retrieval 耗时反推"检索确实跑过"，检索内容无从核对。
         examples = state.get("retrieved_examples")
+        candidates = state.get("retrieval_candidates")
+        if not isinstance(candidates, list):
+            candidates = examples if isinstance(examples, list) else []
         if examples is not None:
+            injected_items = {
+                id(item) for item in (examples or []) if isinstance(item, dict)
+            }
             reasoning_chars = int(state.get("reasoning_reference_chars", 0) or 0)
             python_chars = int(state.get("python_reference_chars", 0) or 0)
+            high_threshold = float(CONFIG.get("db_high_similarity", 0.85))
+            related_threshold = float(CONFIG.get("db_related_similarity", 0.60))
+            related_limit = int(CONFIG.get("db_related_inject_k", 3) or 3)
             trace.append({
                 "step": "database_retrieval",
                 "source": "src/nodes/database_retrieval_node.py::database_retrieval_node",
-                "count": len(examples),
+                "count": len(candidates),
+                "injected_count": len(examples or []),
                 "injected_into": [name for name, chars in
                                   (("reasoning_agent", reasoning_chars
                                     + int(state.get("reasoning_knowledge_card_chars", 0) or 0)),
@@ -89,6 +100,30 @@ class ReasoningAgent:
                 "thinking": {
                     "purpose": "解题前用原题检索竞赛题库，把最相似的题目与解答作为参考"
                                "示例注入推理与验证两个子代理。",
+                    "relation_thresholds": {
+                        "high_similarity": {
+                            "condition": f"similarity > {high_threshold:.2f}",
+                            "injection": "完整题面和参考解答",
+                            "max_injected": 1,
+                        },
+                        "related": {
+                            "condition": (
+                                f"{related_threshold:.2f} < similarity <= "
+                                f"{high_threshold:.2f}"
+                            ),
+                            "injection": "方法参考，隐藏具体结论/答案/数值",
+                            "max_injected": related_limit,
+                        },
+                        "irrelevant": {
+                            "condition": f"similarity <= {related_threshold:.2f}",
+                            "injection": "不注入，仅保留检索轨迹",
+                            "max_injected": 0,
+                        },
+                    },
+                    "selection_policy": (
+                        "有 high_similarity 时只注入最高的一条；否则注入最高的 related 记录"
+                        f"（最多 {related_limit} 条）"
+                    ),
                     "reference_block_chars": {
                         "reasoning_agent": reasoning_chars,
                         "python_agent": python_chars,
@@ -106,19 +141,20 @@ class ReasoningAgent:
                 },
                 "tools": [{
                     "name": "vector_database_query",
-                    "top_k": len(examples),
+                    "top_k": len(candidates),
+                    "injected_top_k": len(examples or []),
                     "results": [
                         {
                             "rank": i,
                             "similarity": ex.get("similarity", 0.0),
                             "relation": ex.get("relation", ""),
                             "relation_reason": ex.get("relation_reason", ""),
+                            "injected": id(ex) in injected_items,
                             "changed_parameters": ex.get("changed_parameters", []),
-                            "source_dataset": ex.get("source_dataset", ""),
                             "problem_chars": len(str(ex.get("problem") or "")),
                             "solution_chars": len(str(ex.get("solution") or "")),
                         }
-                        for i, ex in enumerate(examples, 1)
+                        for i, ex in enumerate(candidates, 1)
                         if isinstance(ex, dict)
                     ],
                     "relation_summary": state.get("retrieval_relation_summary", {}),

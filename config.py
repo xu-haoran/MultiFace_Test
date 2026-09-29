@@ -23,30 +23,29 @@ CONFIG = {
         "semantic_arbiter": 150,
         "coordinator": 420,
     },
-    "classifier_confidence_threshold": 0.85,
 
     # 向量检索与参考题注入
     "db_retrieval_top_k": 2,
     "db_retrieval_recall_k": 10,
-    "db_high_similarity": 0.88,
-    "db_template_similarity": 0.70,
-    "db_template_inject_k": 3,
+    # 关系分档：>0.85 高相似直供；0.60<sim≤0.85 相关方法；≤0.60 不注入。
+    "db_high_similarity": 0.85,
+    "db_related_similarity": 0.60,
+    "db_related_inject_k": 3,
     "high_similarity_reference_enabled": True,
     "database_answer_fallback_enabled": False,
     "high_similarity_worked_review_enabled": True,
 
     # 混合检索和大学数学知识卡
     "hybrid_retrieval_enabled": True,
-    "hybrid_dense_recall_k": 36,
-    "hybrid_sparse_recall_k": 36,
-    "hybrid_final_k": 14,
+    "hybrid_dense_recall_k": 30,
+    "hybrid_sparse_recall_k": 30,
+    "hybrid_final_k": 10,
     "knowledge_cards_enabled": True,
     "knowledge_card_limit": 3,
 
     # 分类与验证
     "classifier_top_k": 3,
-    "computation_tolerance": 1e-6,
-    "proof_confidence_threshold": 0.7,
+    "classifier_confidence_threshold": 0.85,
 
     # 各阶段采样温度：数学推理保持低随机性
     "temperatures": {
