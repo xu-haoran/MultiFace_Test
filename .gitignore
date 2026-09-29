@@ -1,14 +1,32 @@
-# Python/cache
+# Python 缓存与编译产物
 __pycache__/
 *.py[cod]
 *.pyo
 
-# Local runtime output
+# 本地运行日志与临时输出
 logs/
 *.log
+
+# 本地测试结果
+outputs/
+results/
+runs/
+
+# 测试、类型检查和格式化工具缓存
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 
-# Rebuildable data-import staging only; keep the committed Chroma database.
+# 本地环境与编辑器文件
+.env
+.env.*
+.vscode/
+.idea/
+*.swp
+*.swo
+Thumbs.db
+.DS_Store
+
+# 可重新生成的数据导入暂存文件；正式 Chroma 数据库仍需提交
 data/database/public_import/staged_records.jsonl
+data/database/**/staged_records.jsonl

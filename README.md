@@ -1,12 +1,12 @@
-# Trial2 数学推理智能体
+# MultiFace 数学推理智能体
 
-Trial2 是面向数学竞赛题的多阶段推理 Agent。评测平台从仓库根目录加载
+MultiFace 是面向数学竞赛题的多阶段推理 Agent。评测平台从仓库根目录加载
 `user_agent.py`，注入官方 Client，并调用 `ReasoningAgent.solve(problem, metadata)`。
 
 ## 项目结构
 
 ```text
-Trial2/
+MultiFace/
 ├─ user_agent.py                 # 平台必需的根入口
 ├─ config.py                     # 模型、检索、温度和时间预算
 ├─ requirements.txt              # Python 依赖
