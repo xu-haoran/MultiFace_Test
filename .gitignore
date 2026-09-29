@@ -1,0 +1,14 @@
+# Python/cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Local runtime output
+logs/
+*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Rebuildable data-import staging only; keep the committed Chroma database.
+data/database/public_import/staged_records.jsonl

@@ -1,0 +1,41 @@
+# HTTP client for the OpenAI-compatible Intern-S chat endpoint.
+requests>=2.31.0,<3
+
+# LangGraph orchestration and RunnableConfig typing used by node wrappers.
+langgraph==1.2.11
+langchain-core==1.6.1
+
+# Optional standalone FastMCP server support for mcp_servers/python_executor/server.py.
+mcp>=1.28.0,<2
+
+# Symbolic, numeric, and scientific computation used by Python verification scripts.
+sympy>=1.12,<2
+mpmath>=1.3,<2
+numpy>=1.24,<3
+scipy>=1.10,<2
+
+# TF-IDF category retrieval for mathematical domain selection.
+scikit-learn>=1.3,<2
+
+# Fast fuzzy matching for category normalization and answer similarity fallback.
+python-Levenshtein>=0.20,<1
+
+# TypedDict NotRequired compatibility.
+typing-extensions>=4.9,<5
+
+# Optional structured stderr logging; logger.py falls back to plain logging if unavailable.
+python-json-logger>=2,<5
+
+# ChromaDB for olympiad problem database retrieval (CPU-only)
+chromadb==1.0.20
+
+# Sentence Transformers for problem embedding (Qwen3-Embedding-0.6B)
+sentence-transformers==5.1.0
+
+# Pin the transformer/tokenizer pair used to build and verify the bundled index.
+transformers==4.57.6
+tokenizers==0.22.2
+safetensors>=0.4,<1
+
+# PyTorch CPU (for embedding model inference)
+torch>=2.0,<3

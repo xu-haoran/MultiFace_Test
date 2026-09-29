@@ -1,0 +1,4 @@
+*.safetensors filter=lfs diff=lfs merge=lfs -text
+*.sqlite3 filter=lfs diff=lfs merge=lfs -text
+data/database/**/*.bin filter=lfs diff=lfs merge=lfs -text
+resources/models/**/*.safetensors filter=lfs diff=lfs merge=lfs -text
