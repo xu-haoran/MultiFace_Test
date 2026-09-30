@@ -1,6 +1,4 @@
 """MultiFace 运行配置。
-
-这里只保存流程参数；平台 Client、密钥、限流和重试由评测平台管理。
 """
 
 CONFIG = {
@@ -25,21 +23,21 @@ CONFIG = {
     },
 
     # 向量检索与参考题注入
-    "db_retrieval_top_k": 2,
-    "db_retrieval_recall_k": 10,
-    # 关系分档：>0.85 高相似直供；0.60<sim≤0.85 相关方法；≤0.60 不注入。
+    "db_retrieval_top_k": 1,
+    "db_retrieval_recall_k": 5,
+    # 关系分档：>0.85 高相似直供；0.70<sim≤0.85 相关方法；≤0.70 不注入。
     "db_high_similarity": 0.85,
-    "db_related_similarity": 0.60,
-    "db_related_inject_k": 3,
+    "db_related_similarity": 0.70,
+    "db_related_inject_k": 1,
     "high_similarity_reference_enabled": True,
     "database_answer_fallback_enabled": False,
     "high_similarity_worked_review_enabled": True,
 
     # 混合检索和大学数学知识卡
     "hybrid_retrieval_enabled": True,
-    "hybrid_dense_recall_k": 30,
-    "hybrid_sparse_recall_k": 30,
-    "hybrid_final_k": 10,
+    "hybrid_dense_recall_k": 15,
+    "hybrid_sparse_recall_k": 15,
+    "hybrid_final_k": 5,
     "knowledge_cards_enabled": True,
     "knowledge_card_limit": 3,
 

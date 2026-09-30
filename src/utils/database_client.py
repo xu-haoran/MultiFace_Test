@@ -114,38 +114,29 @@ class DatabaseClient:
                 "Ensure the repository contains data/database/chroma.sqlite3."
             )
 
+        # Keep an absolute path throughout the client lifetime.  The legacy
+        # persistent backend resolves its vector-segment directory lazily;
+        # temporarily changing cwd would make that directory relative to the
+        # caller's cwd after initialization, leaving the index unloaded on
+        # Windows paths containing non-ASCII characters.
         chroma_path = str(self.db_dir)
-        previous_cwd = None
-        if os.name == "nt" and any(ord(ch) > 127 for ch in chroma_path):
-            try:
-                relative = self.db_dir.relative_to(PROJECT_ROOT)
-                previous_cwd = os.getcwd()
-                os.chdir(PROJECT_ROOT)
-                chroma_path = str(relative)
-            except Exception:
-                pass
         try:
-            try:
-                self._client = chromadb.PersistentClient(path=chroma_path)
-                self._collection = self._client.get_collection(self.collection_name)
-            except Exception as persistent_error:
-                from chromadb.config import Settings
-                settings = Settings(
-                    is_persistent=True,
-                    persist_directory=chroma_path,
-                    chroma_api_impl="chromadb.api.segment.SegmentAPI",
-                    allow_reset=False,
-                )
-                self._client = chromadb.Client(settings)
-                self._collection = self._client.get_collection(self.collection_name)
-                if self._collection.count() <= 0:
-                    raise persistent_error
-        finally:
-            if previous_cwd is not None:
-                try:
-                    os.chdir(previous_cwd)
-                except OSError:
-                    pass
+            # Use the Python persistent backend first.  The submission
+            # bundles a portable hnswlib compatibility layer that stores
+            # vectors.npy; the Rust backend can open the SQLite catalog
+            # but cannot read that local index format after a restart.
+            from chromadb.config import Settings
+            settings = Settings(
+                is_persistent=True,
+                persist_directory=chroma_path,
+                chroma_api_impl="chromadb.api.segment.SegmentAPI",
+                allow_reset=False,
+            )
+            self._client = chromadb.Client(settings)
+            self._collection = self._client.get_collection(self.collection_name)
+        except Exception as persistent_error:
+            self._client = chromadb.PersistentClient(path=chroma_path)
+            self._collection = self._client.get_collection(self.collection_name)
 
     def query(self, problem: str, top_k: int = 3) -> List[Dict[str, Any]]:
         """Query database for similar problems+solutions.
@@ -306,12 +297,12 @@ class DatabaseClient:
             <solution text>
         """
         prob_match = re.search(
-            r'## Problem\s*(.*?)(?=## Solution|\Z)',
-            doc, re.DOTALL | re.IGNORECASE
+            r'^[ \t]*##[ \t]+Problem\b[ \t]*(.*?)(?=^[ \t]*##[ \t]+Solution\b|\Z)',
+            doc, re.DOTALL | re.IGNORECASE | re.MULTILINE
         )
         sol_match = re.search(
-            r'## Solution\s*(.*?)(?=## Problem|\Z)',
-            doc, re.DOTALL | re.IGNORECASE
+            r'^[ \t]*##[ \t]+Solution\b[ \t]*(.*?)(?=^[ \t]*##[ \t]+Problem\b|\Z)',
+            doc, re.DOTALL | re.IGNORECASE | re.MULTILINE
         )
 
         problem = prob_match.group(1).strip() if prob_match else ""

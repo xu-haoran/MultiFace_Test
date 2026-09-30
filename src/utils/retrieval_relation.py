@@ -109,7 +109,7 @@ def classify_relation(
     similarity: float,
     *,
     high_similarity_min: float = 0.85,
-    related_min_similarity: float = 0.60,
+    related_min_similarity: float = 0.70,
 ) -> Dict[str, Any]:
     """Return high_similarity/related/irrelevant with evidence.
 
@@ -151,7 +151,7 @@ def annotate_candidates(
     candidates: Iterable[Dict[str, Any]],
     *,
     high_similarity_min: float = 0.85,
-    related_min_similarity: float = 0.60,
+    related_min_similarity: float = 0.70,
 ) -> list[Dict[str, Any]]:
     annotated = []
     for raw in candidates:

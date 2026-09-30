@@ -129,7 +129,7 @@ def build_reference_block(
         solution_type = str(example.get("solution_type") or "worked_solution")
         relation_label = {
             "high_similarity": "高相似度直供（检索相似度 >0.85）",
-            "related": "相关题型/方法参考（0.60 < 检索相似度 ≤ 0.85）",
+            "related": "相关题型/方法参考（0.70 < 检索相似度 ≤ 0.85）",
         }.get(relation, "关系未确认")
         parts.append(
             f"\n### 示例 {i}（关系: {relation_label}；相似度: {similarity:.3f}；"

@@ -90,7 +90,7 @@ def database_retrieval_node(state: Dict[str, Any], config: Dict) -> Dict[str, An
             problem,
             raw_results,
             high_similarity_min=float(CONFIG.get("db_high_similarity", 0.85)),
-            related_min_similarity=float(CONFIG.get("db_related_similarity", 0.60)),
+            related_min_similarity=float(CONFIG.get("db_related_similarity", 0.70)),
         )
         examples = select_for_injection(
             candidates,
