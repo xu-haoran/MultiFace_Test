@@ -25,9 +25,9 @@ CONFIG = {
     # 向量检索与参考题注入
     "db_retrieval_top_k": 1,
     "db_retrieval_recall_k": 5,
-    # 关系分档：>0.85 高相似直供；0.70<sim≤0.85 相关方法；≤0.70 不注入。
+    # 关系分档：>0.85 高相似直供；0.75<sim≤0.85 相关方法；≤0.75 不注入。
     "db_high_similarity": 0.85,
-    "db_related_similarity": 0.70,
+    "db_related_similarity": 0.75,
     "db_related_inject_k": 1,
     "high_similarity_reference_enabled": True,
     "database_answer_fallback_enabled": False,
