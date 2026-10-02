@@ -150,16 +150,23 @@ class HybridRetriever:
                     view, top_k=per_view_dense), 1):
                 record = dict(item)
                 record_id = str(record.get("record_id") or f"dense:{view_index}:{rank}")
-                score = float(record.get("similarity") or 0.0)
+                raw_dense = record.get("dense_similarity")
+                if raw_dense is None and record.get("sparse_similarity") is None:
+                    # Accept legacy dense clients, but never reinterpret a sparse score.
+                    raw_dense = record.get("similarity")
+                score = float(raw_dense or 0.0)
+                record["dense_similarity"] = score
+                record["similarity"] = score
+                record.setdefault("sparse_similarity", None)
                 if record_id not in dense_by_id or score > float(
-                        dense_by_id[record_id].get("similarity") or 0.0):
+                        dense_by_id[record_id].get("dense_similarity") or 0.0):
                     record["record_id"] = record_id
                     record["query_view"] = view_index
                     dense_by_id[record_id] = record
                     dense_rank_by_id[record_id] = rank + view_index * per_view_dense
         dense = sorted(
             dense_by_id.values(),
-            key=lambda item: float(item.get("similarity") or 0.0),
+            key=lambda item: float(item.get("dense_similarity") or 0.0),
             reverse=True,
         )
         for item in dense:

@@ -172,11 +172,16 @@ class DatabaseClient:
             res["ids"][0], res["documents"][0], res["metadatas"][0], res["distances"][0]
         ):
             problem_text, solution_text = self._parse_document(doc)
+            dense_similarity = 1 - dist
             results.append({
                 "record_id": str(record_id),
                 "problem": problem_text,
                 "solution": solution_text,
-                "similarity": 1 - dist,  # cosine distance -> similarity
+                "dense_similarity": dense_similarity,
+                # Backward-compatible alias; this field always means dense similarity.
+                "similarity": dense_similarity,
+                "sparse_similarity": None,
+                "hybrid_score": None,
                 "source": meta.get("source", ""),
                 "source_dataset": meta.get("source_dataset") or meta.get("dataset", "olympiad"),
                 "solution_type": meta.get("solution_type", "worked_solution"),
@@ -221,11 +226,16 @@ class DatabaseClient:
             for record_id, doc, meta, dist in zip(ids, docs, metas, distances):
                 meta = meta or {}
                 problem_text, solution_text = self._parse_document(doc)
+                dense_similarity = 1 - dist
                 row.append({
                     "record_id": str(record_id),
                     "problem": problem_text,
                     "solution": solution_text,
-                    "similarity": 1 - dist,
+                    "dense_similarity": dense_similarity,
+                    # Backward-compatible alias; this field always means dense similarity.
+                    "similarity": dense_similarity,
+                    "sparse_similarity": None,
+                    "hybrid_score": None,
                     "source": meta.get("source", ""),
                     "source_dataset": meta.get("source_dataset") or meta.get("dataset", "olympiad"),
                     "solution_type": meta.get("solution_type", "worked_solution"),
@@ -269,12 +279,16 @@ class DatabaseClient:
             meta = meta or {}
             problem_text, solution_text = self._parse_document(doc)
             record_key = str(record_id)
-            similarity = float(lexical_scores.get(record_key, 0.0))
+            sparse_similarity = float(lexical_scores.get(record_key, 0.0))
             results.append({
                 "record_id": str(record_id),
                 "problem": problem_text,
                 "solution": solution_text,
-                "similarity": similarity,
+                # Sparse-only rows have no dense score. Never overload `similarity`.
+                "dense_similarity": None,
+                "sparse_similarity": sparse_similarity,
+                "hybrid_score": None,
+                "similarity": None,
                 "source": meta.get("source", ""),
                 "source_dataset": meta.get("source_dataset") or meta.get("dataset", "olympiad"),
                 "solution_type": meta.get("solution_type", "worked_solution"),

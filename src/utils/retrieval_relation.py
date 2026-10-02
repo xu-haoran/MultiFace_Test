@@ -1,11 +1,4 @@
-"""Relation labels for retrieved mathematics problems.
-
-All relation tiers are determined by the retrieval score supplied by the
-database layer.  A strict ``>0.85`` gate marks a high-similarity record whose
-full problem and solution may be shown to the solver; lower score bands are
-related or irrelevant. Text normalization is retained only for
-diagnostic parameter/qualifier annotations, never for tier selection.
-"""
+"""Dense-similarity relation labels and a separate answer-reuse safety gate."""
 
 from __future__ import annotations
 
@@ -91,6 +84,56 @@ def _critical_signature(text: str) -> frozenset[str]:
     return frozenset(found)
 
 
+def _answer_identity(text: str) -> str:
+    """Normalize only Unicode and whitespace for conservative answer reuse.
+
+    Unlike the diagnostic problem normalizer, this deliberately preserves case,
+    punctuation, LaTeX commands, operators, subscripts, and numeric literals.
+    False negatives merely disable answer reuse; false positives could leak a
+    different problem's answer.
+    """
+    value = unicodedata.normalize("NFC", str(text or ""))
+    return _SPACE_RE.sub(" ", value).strip()
+
+
+def dense_similarity_score(item: Dict[str, Any]) -> float | None:
+    """Read only a dense score; legacy `similarity` is accepted in isolation."""
+    value = item.get("dense_similarity")
+    if value is None:
+        # Compatibility for callers that still provide only a dense `similarity`.
+        # If sparse or fused scores exist, the old field is ambiguous and rejected.
+        if item.get("sparse_similarity") is not None or item.get("hybrid_score") is not None:
+            return None
+        value = item.get("similarity")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def answer_reuse_safety(
+    problem: str,
+    candidate: Dict[str, Any],
+    *,
+    high_similarity_min: float = 0.85,
+) -> tuple[bool, str]:
+    """Allow answer-bearing reuse only for an exact normalized prompt match."""
+    if candidate.get("relation") != "high_similarity":
+        return False, "not_high_similarity"
+    score = dense_similarity_score(candidate)
+    if score is None or score <= float(high_similarity_min):
+        return False, "no_dense_high_similarity_evidence"
+    candidate_problem = str(candidate.get("problem") or "")
+    if not problem or not candidate_problem or _answer_identity(problem) != _answer_identity(candidate_problem):
+        return False, "problem_not_identical_after_safe_normalization"
+    if not (str(candidate.get("solution") or "").strip()
+            or str(candidate.get("reference_answer") or "").strip()):
+        return False, "reference_answer_missing"
+    return True, "exact_problem_with_dense_match_and_reference_answer"
+
+
 def _changed_parameters(problem: str, candidate: str) -> list[str]:
     ours = number_literals(problem)
     theirs = number_literals(candidate)
@@ -113,7 +156,7 @@ def classify_relation(
 ) -> Dict[str, Any]:
     """Return high_similarity/related/irrelevant with evidence.
 
-    Every relation decision uses only ``similarity``.  Text-normalized
+    Every relation decision uses only dense similarity. Text-normalized
     parameter/qualifier annotations are diagnostic context and do not override
     the score band.
     """
@@ -123,7 +166,7 @@ def classify_relation(
     if score > float(high_similarity_min):
         return {
             "relation": "high_similarity",
-            "relation_reason": "retrieval_similarity_above_threshold",
+            "relation_reason": "dense_similarity_above_threshold",
             "changed_parameters": [],
             "changed_qualifiers": [],
         }
@@ -133,14 +176,14 @@ def classify_relation(
     if score > float(related_min_similarity):
         return {
             "relation": "related",
-            "relation_reason": "retrieval_similarity_in_related_band",
+            "relation_reason": "dense_similarity_in_related_band",
             "changed_parameters": changed,
             "changed_qualifiers": critical_mismatch,
         }
 
     return {
         "relation": "irrelevant",
-        "relation_reason": "retrieval_similarity_at_or_below_related_threshold",
+        "relation_reason": "dense_similarity_at_or_below_related_threshold",
         "changed_parameters": changed,
         "changed_qualifiers": critical_mismatch,
     }
@@ -156,15 +199,35 @@ def annotate_candidates(
     annotated = []
     for raw in candidates:
         item = dict(raw or {})
+        item["high_similarity_min"] = float(high_similarity_min)
+        item["related_min_similarity"] = float(related_min_similarity)
+        dense_similarity = dense_similarity_score(item)
+        item["dense_similarity"] = dense_similarity
+        # Keep old readers working without allowing sparse/fused values here.
+        item["similarity"] = dense_similarity
         item.update(classify_relation(
             problem,
             item.get("problem", ""),
-            item.get("similarity", 0.0),
+            dense_similarity or 0.0,
             high_similarity_min=high_similarity_min,
             related_min_similarity=related_min_similarity,
         ))
-        # 只有高相似记录可提供解答正文；相关题仅作方法提示。
-        item["answer_safe"] = item.get("relation") == "high_similarity"
+        sparse_similarity = item.get("sparse_similarity")
+        if dense_similarity is None and sparse_similarity is not None:
+            try:
+                has_lexical_evidence = float(sparse_similarity) > 0.0
+            except (TypeError, ValueError):
+                has_lexical_evidence = False
+            if has_lexical_evidence:
+                # Lexical-only evidence may suggest a method, but cannot enter
+                # the dense-similarity bands or authorize answer reuse.
+                item["relation"] = "sparse_reference"
+                item["relation_reason"] = "sparse_only_method_reference"
+        safe, reason = answer_reuse_safety(
+            problem, item, high_similarity_min=high_similarity_min
+        )
+        item["answer_safe"] = safe
+        item["answer_safety_reason"] = reason
         annotated.append(item)
     return annotated
 
@@ -174,13 +237,17 @@ def select_for_injection(
     *,
     related_limit: int = 3,
 ) -> list[Dict[str, Any]]:
-    """Keep a small, relation-aware context after broad retrieval."""
+    """Keep a small relation-aware context; high-similarity gets one full reference."""
     values = list(candidates)
-    high_similarity = [item for item in values if item.get("relation") == "high_similarity"]
+    high_similarity = [item for item in values
+                       if item.get("relation") == "high_similarity"]
     if high_similarity:
+        # The dense-similarity band controls visibility of one complete example;
+        # answer_reuse_safety remains a separate gate for adopting its answer.
         return high_similarity[:1]
-    related = [item for item in values if item.get("relation") == "related"]
-    if related and related_limit > 0:
-        return related[:max(1, related_limit)]
+    method_only = [item for item in values
+                   if item.get("relation") in {"related", "sparse_reference"}]
+    if method_only and related_limit > 0:
+        return method_only[:related_limit]
     return []
 

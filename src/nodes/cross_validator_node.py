@@ -100,7 +100,7 @@ def _preferred_answer(state: dict, match_result: dict) -> str:
         return ""
     # 高相似例题只作为推理参考，不提取或锁定答案；冲突时按验证证据选择。
     has_high_similarity_worked_example = any(
-        isinstance(item, dict) and item.get("relation") == "high_similarity"
+        isinstance(item, dict) and item.get("answer_safe") is True
         for item in (state.get("retrieved_examples") or [])
     )
     if has_high_similarity_worked_example and reasoning_ok:

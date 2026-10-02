@@ -1,4 +1,6 @@
 import re
+import unicodedata
+from collections import Counter
 
 from utils.deps import get_deps
 from utils.answer_cleanliness import extract_partial_findings, is_noise_answer
@@ -14,6 +16,7 @@ from utils.db_fallback import (
     MIN_SIMILARITY as DB_MIN_SIMILARITY,
     db_fallback_response,
 )
+from utils.retrieval_relation import answer_reuse_safety
 from utils.cot_stripper import is_placeholder_answer, strip_cot_prefix
 from utils.answer_extractor import looks_incomplete_answer
 from utils.llm_retry import chat_prefilled, chat_with_retry
@@ -25,7 +28,9 @@ from config import CONFIG
 from utils.problem_profile import (
     fill_answer_matches_blanks,
     is_objective_mode,
+    normalize_objective_answer,
     objective_answer_is_consistent,
+    objective_answer_is_usable,
 )
 
 
@@ -116,33 +121,56 @@ def _database_reference_block(state: dict, limit: int = 2) -> str:
         if not isinstance(example, dict):
             continue
         try:
-            similarity = float(example.get("similarity") or 0.0)
+            similarity = float(example.get("dense_similarity") or 0.0)
         except (TypeError, ValueError):
             similarity = 0.0
-        if similarity < DB_MIN_SIMILARITY:
-            continue
         relation = str(example.get("relation") or "")
         if relation == "irrelevant":
             continue
+        answer_safe, _ = answer_reuse_safety(
+            str((state or {}).get("problem") or ""),
+            example,
+            high_similarity_min=float(example.get("high_similarity_min", 0.85) or 0.85),
+        )
         high_similarity = relation == "high_similarity"
+        answer_reuse_safe = example.get("answer_safe") is True and answer_safe
+        if high_similarity and similarity <= DB_MIN_SIMILARITY:
+            continue
         if high_similarity:
+            reuse_status = "答案复用门槛通过" if answer_reuse_safe else "答案复用门槛未通过"
+            use_boundary = (
+                "题面匹配且有参考答案；仍须核验当前题条件。"
+                if answer_reuse_safe else
+                "完整解仅因高相似而展示；不代表同题，须按当前题独立核验，不得直接搬用结论。"
+            )
             lines.append(
-                f"\n[题库高相似度直供 检索相似度{similarity:.3f}]\n"
+                f"\n[高度一致候选题：high_similarity；{reuse_status}；"
+                f"稠密相似度 {similarity:.3f}]\n"
                 f"题面：{str(example.get('problem') or '')[:600]}\n"
-                f"完整解答：{str(example.get('solution') or '')[:1200]}\n"
+                f"使用边界：{use_boundary}\n"
+                f"完整解答：{str(example.get('solution') or example.get('reference_answer') or '')[:1200]}\n"
             )
             continue
-        entry = (f"\n[题库相似题 相似度{similarity:.3f}]\n"
+        if relation == "related":
+            label = "相似题目：不是已确认的同一道题，仅供参考解题过程"
+        elif relation == "high_similarity":
+            label = "高度一致候选题：按稠密相似度分档；仅供参考解题过程"
+        else:
+            label = "关键词相关候选：仅供参考方法"
+        entry = (f"\n[{label}；稠密相似度 {similarity:.3f}]\n"
                  f"题面：{str(example.get('problem') or '')[:600]}\n")
         entry += (
-            "仅提供题型/方法参考；具体结论、答案和数值已隐藏：\n"
+            "不要把参考题的答案、结论或参数当作本题内容；仅借鉴解题思路，"
+            "并按当前题条件独立推导：\n"
             f"{_method_only_solution(str(example.get('solution') or ''), 600)}\n"
         )
         lines.append(entry)
     if not lines:
         return ""
-    return ("\n题库检索到的题目与解答参考（检索相似度严格 >0.85 的高相似度记录直接提供；"
-            "其余记录仅作近似题方法参考）：\n" + "".join(lines))
+    return ("\n题库参考规则：high_similarity 按稠密相似度分档并标为高度一致候选题，"
+            "不要求题面规范化后完全一致，排名最高的一条会展示完整参考解；"
+            "答案安全门槛仍决定能否复用答案，但不决定是否展示。"
+            "related 是相似题目，只参考解题过程，不得复用答案或结论。\n" + "".join(lines))
 
 
 def _database_reference_fallback(state: dict, deps) -> tuple[str, str]:
@@ -170,7 +198,7 @@ def _with_emergency_answer(guess: str, partial: str, source: str) -> str:
 def _clean_high_similarity_worked_answer(answer: str, state: dict) -> str:
     """清理高相似例题参考后的解释尾部，不读取标准答案。"""
     examples = state.get("retrieved_examples") or []
-    if not any(isinstance(item, dict) and item.get("relation") == "high_similarity"
+    if not any(isinstance(item, dict) and item.get("answer_safe") is True
                for item in examples):
         return answer
     text = str(answer or "").strip()
@@ -184,6 +212,87 @@ def _clean_high_similarity_worked_answer(answer: str, state: dict) -> str:
     if len(equations) == 1:
         return equations[0]
     return text
+
+
+def _coordinator_vote_key(answer: str, problem_type: str, question_mode: str) -> str:
+    """把格式化答案转成保守的投票键，不做数学等价猜测。"""
+    if is_objective_mode(question_mode):
+        return normalize_objective_answer(answer, question_mode)
+
+    text = str(answer or "").strip()
+    if problem_type == "proof" and "\n\n" in text:
+        # 证明题按结论投票，保留被选中候选的完整证明正文。
+        text = text.split("\n\n", 1)[0].strip()
+    text = _strip_answer_label(text)
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"\\(?:left|right)\b", "", text)
+    text = re.sub(r"\\[,;! ]", "", text)
+    text = re.sub(r"\\([A-Za-z]+)\s+", r"\\\1", text)
+    text = re.sub(r"\s*([=+*/^,;(){}\[\]])\s*", r"\1", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip(" \t\r\n$`。．;；")
+
+
+def _coordinator_vote_candidate(raw: str, problem_type: str, question_mode: str,
+                                problem: str) -> dict | None:
+    """抽取并格式化一次协调器结果；无效答案不进入投票。"""
+    cleaned_raw = strip_cot_prefix(raw or "")
+    if not cleaned_raw:
+        return None
+
+    format_type = question_mode if is_objective_mode(question_mode) else problem_type
+    final = post_process_final_response(
+        cleaned_raw, "", format_type, problem=problem
+    ).strip()
+    if not final or _declares_no_answer(final):
+        return None
+
+    if is_objective_mode(question_mode):
+        normalized = normalize_objective_answer(final, question_mode)
+        if not objective_answer_is_usable(normalized, question_mode):
+            return None
+        if question_mode == "fill" and not fill_answer_matches_blanks(normalized, problem):
+            return None
+        if not objective_answer_is_consistent(normalized, problem, question_mode):
+            return None
+        final = format_fill_submission(normalized) if question_mode == "fill" else normalized
+        key = normalize_objective_answer(final, question_mode)
+    elif problem_type == "proof":
+        conclusion = final.split("\n\n", 1)[0].strip()
+        if (not conclusion or is_placeholder_answer(conclusion)
+                or _declares_no_answer(conclusion) or is_noise_answer(conclusion)
+                or looks_incomplete_answer(conclusion)):
+            return None
+        key = _coordinator_vote_key(final, problem_type, question_mode)
+    else:
+        if (is_placeholder_answer(final) or is_noise_answer(final)
+                or looks_incomplete_answer(final)):
+            return None
+        key = _coordinator_vote_key(final, problem_type, question_mode)
+
+    if not key:
+        return None
+    return {"final": final, "key": key, "cleaned_raw": cleaned_raw}
+
+
+def _select_coordinator_vote(candidates: list[dict], validated: str,
+                             problem_type: str, question_mode: str) -> tuple[dict | None, str]:
+    """多数优先；无多数时只取可用候选，优先与现有验证答案一致。"""
+    counts = Counter(candidate["key"] for candidate in candidates)
+    majority_key, majority_count = counts.most_common(1)[0] if counts else ("", 0)
+    if majority_count >= 2:
+        return next(c for c in candidates if c["key"] == majority_key), "majority"
+
+    if validated:
+        validated_key = _coordinator_vote_key(validated, problem_type, question_mode)
+        matching = [candidate for candidate in candidates if candidate["key"] == validated_key]
+        if matching:
+            return matching[0], "validated_consistent_candidate"
+        return None, "validated_answer_no_majority"
+
+    if candidates:
+        return candidates[0], "first_valid_without_majority"
+    return None, "no_valid_candidate"
 
 
 def _partial_response(state: dict) -> tuple[str, str]:
@@ -306,7 +415,7 @@ def coordinator_node(state, config):
     ):
         validated = ""
     has_high_similarity_worked_example = any(
-        isinstance(item, dict) and item.get("relation") == "high_similarity"
+        isinstance(item, dict) and item.get("answer_safe") is True
         for item in (state.get("retrieved_examples") or [])
     )
     if is_objective_mode(question_mode) and validated and not has_high_similarity_worked_example:
@@ -406,43 +515,88 @@ def coordinator_node(state, config):
             state.get("retrieved_examples"), problem_chars=700,
             solution_chars=1000, problem=state.get("problem", "")),
     )
-    try:
-        raw = chat_with_retry(
-            client,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=CONFIG["temperatures"]["coordinator"],
-            max_tokens=CONFIG["max_tokens"]["coordinator"],
-            logger=deps.logger,
-            time_budget=time_budget,
-            label="coordinator",
+    candidates = []
+    attempted = 0
+    failed_calls = 0
+    expected_call_seconds = 60
+    vote_attempt_limit = max(1, int(CONFIG.get("coordinator_vote_attempts", 3)))
+    for vote_number in range(1, vote_attempt_limit + 1):
+        if time_budget and not time_budget.can_afford(expected_call_seconds):
+            break
+        attempted += 1
+        try:
+            raw = chat_with_retry(
+                client,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=CONFIG["temperatures"]["coordinator"],
+                max_tokens=CONFIG["max_tokens"]["coordinator"],
+                logger=deps.logger,
+                time_budget=time_budget,
+                expected_call_seconds=expected_call_seconds,
+                label=f"coordinator_vote_{vote_number}",
+            )
+        except Exception as exc:  # noqa: BLE001 - one failed sample must not erase others.
+            failed_calls += 1
+            deps.logger.warning("Coordinator vote %s failed: %s", vote_number, exc)
+            continue
+        if budget:
+            budget.consume(estimate_tokens(prompt), estimate_tokens(raw or ""))
+        candidate = _coordinator_vote_candidate(
+            raw, ptype, question_mode, state.get("problem", "")
         )
-    except Exception as exc:  # noqa: BLE001 - never lose an answer we already hold.
-        deps.logger.warning("Coordinator LLM unavailable (%s); emitting validated answer", exc)
-        if not validated:
-            # 保留已有部分证据，避免异常回退覆盖为通用失败文本。
-            partial, source = _partial_response(state)
-            guess = _emergency_direct_answer(state, deps)
-            if guess:
-                return {"final_response": _with_emergency_answer(guess, partial, source),
-                        "coordination_detail": "",
-                        "fallback_source": "emergency_direct_answer"}
-            db_final, db_source = _database_reference_fallback(state, deps)
-            if db_final:
-                return {"final_response": db_final, "coordination_detail": "",
-                        "fallback_source": db_source}
-            return {"final_response": partial, "coordination_detail": "",
-                    "fallback_source": source}
-        final = validated
-        if ptype == "proof":
-            final = build_proof_body(final, rr)
-        return {"final_response": final, "coordination_detail": "",
-                "fallback_source": evidence_note or "validated_answer"}
-    if budget:
-        budget.consume(estimate_tokens(prompt), estimate_tokens(raw))
-    cleaned_raw = strip_cot_prefix(raw)
-    final = post_process_final_response(cleaned_raw, validated, ptype, problem=state["problem"])
-    if not isinstance(final, str) or not final.strip():
-        final = validated if validated else "无法生成完整答案。"
+        if candidate:
+            candidates.append(candidate)
+
+    selected, selection = _select_coordinator_vote(
+        candidates, validated, ptype, question_mode
+    )
+    vote_summary = {
+        "requested": vote_attempt_limit,
+        "attempted": attempted,
+        "valid_candidates": len(candidates),
+        "failed_calls": failed_calls,
+        "majority": selection == "majority",
+        "selection": selection,
+    }
+    if selected is None:
+        deps.logger.warning(
+            "Coordinator voting found no selectable candidate (%s); using validated fallback",
+            selection,
+        )
+        if validated:
+            final = build_proof_body(validated, rr) if ptype == "proof" else validated
+            return {
+                "final_response": final,
+                "coordination_detail": "",
+                "fallback_source": evidence_note or "validated_answer_no_majority",
+                "coordination_vote_summary": vote_summary,
+            }
+        partial, source = _partial_response(state)
+        guess = _emergency_direct_answer(state, deps)
+        if guess:
+            return {
+                "final_response": _with_emergency_answer(guess, partial, source),
+                "coordination_detail": "",
+                "fallback_source": "emergency_direct_answer",
+                "coordination_vote_summary": vote_summary,
+            }
+        db_final, db_source = _database_reference_fallback(state, deps)
+        if db_final:
+            return {
+                "final_response": db_final,
+                "coordination_detail": "",
+                "fallback_source": db_source,
+                "coordination_vote_summary": vote_summary,
+            }
+        return {
+            "final_response": partial,
+            "coordination_detail": "",
+            "fallback_source": source,
+            "coordination_vote_summary": vote_summary,
+        }
+
+    final = selected["final"]
+    cleaned_raw = selected["cleaned_raw"]
     # 声明式非答案闸门：叙述层在没拿到 validated_answer 时会写出"最终答案：无法
     # 确定"（评委报告 idx 86），这必然判 0。只要还能找出一个具体候选就让位给它。
     if _declares_no_answer(final):
@@ -452,29 +606,30 @@ def coordinator_node(state, config):
             partial, source = _partial_response(state)
             return {"final_response": _with_emergency_answer(guess, partial, source),
                     "coordination_detail": cleaned_raw,
-                    "fallback_source": "emergency_direct_answer"}
+                    "fallback_source": "emergency_direct_answer",
+                    "coordination_vote_summary": vote_summary}
         db_final, db_source = _database_reference_fallback(state, deps)
         if db_final:
             return {"final_response": db_final, "coordination_detail": cleaned_raw,
-                    "fallback_source": db_source}
+                    "fallback_source": db_source,
+                    "coordination_vote_summary": vote_summary}
         partial, source = _partial_response(state)
         if source != "generic_error":
             return {"final_response": partial, "coordination_detail": cleaned_raw,
-                    "fallback_source": source}
+                    "fallback_source": source,
+                    "coordination_vote_summary": vote_summary}
         # 什么都没有：保留叙述本身——返回值规范要求非空可读字符串。
 
-    # 可选的高相似例题复核：模型看到完整例题并独立检查候选，不锁定答案。
+    # 高相似参考复核仍可提供独立核对，但不能改写三次协调器投票选出的答案。
     if (bool(CONFIG.get("high_similarity_worked_review_enabled", False))
             and ptype != "proof" and not state.get("answer_locked")):
         high_similarity_examples = [item for item in (state.get("retrieved_examples") or [])
-                                     if isinstance(item, dict) and item.get("relation") == "high_similarity"]
+                                     if isinstance(item, dict) and item.get("answer_safe") is True]
         if high_similarity_examples:
             example = high_similarity_examples[0]
             review_prompt = (
-                "请作为高相似度教材解的最终复核者。下面的参考解来自检索相似度严格大于 0.85 的"
-                "普通工作示例，不是标准答案字段。逐项核对题面和参考解的关键条件；若候选"
-                "与参考解或题面冲突，改为你复核后的结论。只输出一行‘最终答案：...’，"
-                "不要解释，不要输出标准答案、答案字段或内部推理。\n"
+                "请独立复核当前候选与题面、参考工作解是否一致。参考解来自检索到的普通工作示例，"
+                "不是标准答案字段。只输出一行‘最终答案：...’，不要解释。\n"
                 f"题目：\n{state.get('problem', '')}\n"
                 f"参考工作解：\n{str(example.get('solution') or '')[:2400]}\n"
                 f"当前候选：\n{final}"
@@ -491,21 +646,19 @@ def coordinator_node(state, config):
                     expected_call_seconds=35,
                     label="high_similarity_worked_review",
                 )
-                reviewed_text = strip_cot_prefix(reviewed_raw or "")
-                reviewed_match = re.search(r"最终答案\s*[：:]\s*(.+)", reviewed_text, re.DOTALL)
-                reviewed = (reviewed_match.group(1) if reviewed_match else reviewed_text).strip()
-                reviewed = reviewed.splitlines()[0].strip() if reviewed else ""
-                reviewed = _strip_answer_label(reviewed)
-                if (reviewed and not is_placeholder_answer(reviewed)
-                        and not is_noise_answer(reviewed)
-                        and not looks_incomplete_answer(reviewed)
-                        and len(reviewed) <= 800):
-                    final = reviewed
-                    deps.logger.info("Final answer replaced by high-similarity worked-example review")
-            except Exception as exc:  # noqa: BLE001 - review never removes a candidate.
+                reviewed = _coordinator_vote_candidate(
+                    reviewed_raw, ptype, question_mode, state.get("problem", "")
+                )
+                vote_summary["reference_review"] = (
+                    "agrees" if reviewed and reviewed["key"] == selected["key"]
+                    else "differs_or_invalid"
+                )
+            except Exception as exc:  # noqa: BLE001 - review never removes a voted answer.
+                vote_summary["reference_review"] = "unavailable"
                 deps.logger.warning("High-similarity worked-example review failed: %s", exc)
 
     # 2026-08-24 评委要求：计算/推导题 final_response 只含答案本身，关键步骤
     # 不再追加（完整解题说明已在 coordination_detail，进 trace 供核查）。
     return {"final_response": final, "coordination_detail": cleaned_raw,
-            "fallback_source": evidence_note or "coordinator_llm"}
+            "fallback_source": evidence_note or "coordinator_vote",
+            "coordination_vote_summary": vote_summary}

@@ -25,17 +25,23 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List
 
+from utils.retrieval_relation import answer_reuse_safety
+
 _HEADER = "\n\n参考示例（统一数学题库召回，已做结构关系检查）：\n"
 _KNOWLEDGE_HEADER = "\n\n本科数学知识卡（项目内学科手册提炼）：\n"
 
 #: 反锚定说明。放在示例**之前**——写在后面时模型往往已经先读完解答并锚定了结论。
 _ANTI_ANCHOR_NOTE = """
-⚠️ 这些记录由向量检索召回。标为“高相似度直供”的记录表示**检索相似度**严格
-大于 0.85，题目与完整解答会直接提供给代理。其余都是近似题，不能直接搬用结论。
+⚠️ 这些记录由检索召回，必须区分以下两类：
+
+- **高度一致候选题（high_similarity）**：仅按稠密检索相似度严格大于 0.85 分档，不要求规范化题面完全一致；该等级会展示排名最高的一条完整参考记录。标签不等于确认同题，参考答案仍须结合当前题条件核验。
+- **相似题目（related）**：仅表示题型或内容相似，不是已确认的同一道题；只供参考解题过程，不能复用其答案、结论或参数。
+
+答案安全门槛仍独立约束答案复用和数据库兜底，但不阻止 high_similarity 候选的完整参考解进入上下文。未通过门槛时必须把参考解当作近似案例，围绕当前题独立推导。
 使用规则：
 
-以下逐项核对规则只约束标为“相关题型/方法参考”的记录；高相似度直供记录遵循
-其独立的使用边界。
+以下逐项核对规则约束所有未通过答案安全门槛的记录；通过门槛的同题记录仍须确认推导
+适用于当前题目。
 
 1. 先逐项核对差异：参数数值（个数/上界/模数）、**奇偶性**、谁做选择、目标是
    最大化还是最小化、约束方向（≤ 还是 <、"所有解"还是"一个解"）。
@@ -50,6 +56,11 @@ _ANTI_ANCHOR_NOTE = """
 _INT_RE = re.compile(r"(?<![\\^_{\w])(\d{2,})(?![}\w])")
 _ANSWER_LINE_RE = re.compile(
     r"(?i)(?:最终答案|标准答案|答案|结论|answer|final\s+answer|correct\s+option)"
+)
+_CONCLUSION_RE = re.compile(
+    r"(?i)(?:\btherefore\b|\bthus\b|\bhence\b|\bconsequently\b|"
+    r"\bit follows that\b|\bwe conclude\b|\bthis shows that\b|"
+    r"\bwhich proves that\b|\bso (?:the|we)\b|故|所以|因此|从而|综上|可得)"
 )
 _NUMBER_LITERAL_RE = re.compile(r"(?<![A-Za-z_])[-+]?\d+(?:\.\d+)?")
 
@@ -95,6 +106,14 @@ def _method_only_solution(solution: str, limit: int) -> str:
     for line in str(solution or "").splitlines():
         if _ANSWER_LINE_RE.search(line):
             continue
+        conclusion = _CONCLUSION_RE.search(line)
+        boxed_answer = re.search(r"\\boxed\s*\{", line)
+        cut_points = [match.start() for match in (conclusion, boxed_answer) if match]
+        if cut_points:
+            line = line[:min(cut_points)]
+            if line.strip():
+                kept.append(_NUMBER_LITERAL_RE.sub("<参数>", line))
+            break
         kept.append(_NUMBER_LITERAL_RE.sub("<参数>", line))
     text = "\n".join(kept).strip()
     return text[:limit] if text else "（仅提供题型方法；具体结论已隐藏。）"
@@ -120,58 +139,77 @@ def build_reference_block(
     parts = [_HEADER, _ANTI_ANCHOR_NOTE]
     for i, example in enumerate(usable, 1):
         try:
-            similarity = float(example.get("similarity") or 0.0)
+            similarity = float(example.get("dense_similarity") or 0.0)
         except (TypeError, ValueError):
             similarity = 0.0
         example_problem = str(example.get("problem") or "")
         relation = str(example.get("relation") or "irrelevant")
+        answer_safe, safety_reason = answer_reuse_safety(
+            problem,
+            example,
+            high_similarity_min=float(example.get("high_similarity_min", 0.85) or 0.85),
+        )
+        answer_safe = answer_safe and example.get("answer_safe") is True
+        full_reference_visible = relation == "high_similarity"
         dataset = str(example.get("source_dataset") or "olympiad")
         solution_type = str(example.get("solution_type") or "worked_solution")
         relation_label = {
-            "high_similarity": "高相似度直供（检索相似度 >0.85）",
-            "related": "相关题型/方法参考（0.70 < 检索相似度 ≤ 0.85）",
+            "high_similarity": (
+                "高度一致候选题（完整参考解已展示；答案复用门槛通过）" if answer_safe
+                else "高度一致候选题（完整参考解已展示；答案复用门槛未通过）"
+            ),
+            "related": (
+                f"相似题目（不是已确认的同一道题；仅供参考解题过程；"
+                f"{float(example.get('related_min_similarity', 0.70)):.2f} "
+                f"< 稠密相似度 ≤ {float(example.get('high_similarity_min', 0.85)):.2f}）"
+            ),
+            "sparse_reference": "关键词召回（仅方法参考；不参与稠密相似度分档）",
         }.get(relation, "关系未确认")
         parts.append(
-            f"\n### 示例 {i}（关系: {relation_label}；相似度: {similarity:.3f}；"
+            f"\n### 示例 {i}（关系: {relation_label}；稠密相似度: {similarity:.3f}；"
             f"来源: {dataset}；资料类型: {solution_type}）\n"
         )
-        if relation == "high_similarity":
+        if answer_safe:
             parts.append(
-                "**使用边界**：这是检索相似度严格大于 0.85 的高置信度直供记录。"
-                "题面和原始解答完整提供给代理，直接作为本题参考；此分支不再做相关题的"
-                "参数屏蔽或字符串模糊处理。请优先沿用解答中的结论与表达，若题面本身出现"
-                "可见冲突，再回到本题条件核对。\n"
+                "**使用边界**：稠密相似度超过阈值，且规范化题面完全一致、参考答案存在。"
+                "可查看完整参考解，但仍要核对其推导与本题条件一致。\n"
+            )
+        elif relation == "high_similarity":
+            parts.append(
+                "**使用边界**：该题因稠密相似度超过阈值而展示完整参考解，无需题面规范化完全一致；"
+                "但未通过答案复用安全门槛，不代表已确认同题。仅作高相似案例对照，"
+                "不得直接搬用结论，须按当前题条件独立推导和验证。\n"
             )
         elif relation == "related":
             changes = example.get("changed_parameters") or []
             parts.append(
-                "**使用边界**：只学习建模与推导方法。参考题答案绝不能直接作为本题答案，"
-                "必须按照下列差异重新计算并验证。\n"
+                "**使用边界**：这只是相似题，不是已确认的同题；仅供参考解题过程。"
+                "不得复用它的答案、结论或参数，必须按当前题条件独立推导并验证。\n"
             )
             if changes:
                 parts.append("**已识别差异**：" + "；".join(map(str, changes[:8])) + "。\n")
         else:
             parts.append(
-                "**使用边界**：该记录不在当前注入等级内，只可借鉴可能相关的方法或定理；"
-                "不要迁移题目结论。\n"
+                "**使用边界**：完整参考答案安全门槛未通过；只可借鉴方法，不要迁移题目结论。"
+                f"（门槛状态：{safety_reason}）\n"
             )
-        # 高相似记录直接提供完整题面和解答，不添加模糊参数说明。
-        diff = _numeric_diff_line(problem, example_problem) if problem and relation != "high_similarity" else ""
+        # high_similarity 展示完整题面和参考解；其答案安全状态仍单独标注。
+        diff = _numeric_diff_line(problem, example_problem) if problem and not answer_safe else ""
         if diff:
             parts.append(diff)
         parts.append(f"**题目：**\n{example_problem[:problem_chars]}\n\n")
         reference_answer = str(example.get("reference_answer") or "").strip()
         solution = str(example.get("solution") or "").strip()
-        if relation == "high_similarity" and (solution_type == "short_reference" or (reference_answer and not solution)):
+        if full_reference_visible and (solution_type == "short_reference" or (reference_answer and not solution)):
             parts.append(
-                "**该参考题的短答案（不是完整题解）：**\n"
+                "**高度一致候选的短答案（不是完整题解；请核验后再用于当前题）：**\n"
                 f"{(reference_answer or solution)[:solution_chars]}\n"
             )
-        elif relation == "high_similarity":
-            parts.append(f"**参考题解：**\n{solution[:solution_chars]}\n")
+        elif full_reference_visible:
+            parts.append(f"**高度一致候选的完整参考解：**\n{solution[:solution_chars]}\n")
         else:
             parts.append(
-                "**参考题方法摘录（参数与结论已屏蔽）：**\n"
+                "**相似题参考解题过程（只借鉴方法，不迁移答案）：**\n"
                 f"{_method_only_solution(solution or reference_answer, solution_chars)}\n"
             )
         if i < len(usable):

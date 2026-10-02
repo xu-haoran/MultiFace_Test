@@ -472,9 +472,9 @@ def reasoning_agent_node(state, config):
     base_prompt += structure_instruction(problem)
     if high_similarity_context:
         base_prompt += (
-            "\n\n[高相似度直供参考优先] 检索区块中检索相似度严格大于 0.85 的记录已直接"
-            "提供题面和原始解答，不再进行相关题的参数屏蔽或字符串模糊处理。优先沿用该解答的"
-            "结论、数学对象和表达结构；若题面出现可见冲突，再按本题条件核对。\n"
+            "\n\n[高相似候选完整参考解] 检索区块因稠密相似度超过 0.85 展示了一条完整参考解，"
+            "不要求规范化题面完全一致。它不一定是同一道题；仅在该条另行标明答案复用门槛通过时，"
+            "才可考虑复用答案，其他情况须针对当前题独立推导并核验。\n"
         )
     # 压缩重试要压的是推导篇幅，不是答案该覆盖的分支（评委复测 idx 14）。
     coverage_clause = answer_coverage_clause(problem)
@@ -554,13 +554,13 @@ def reasoning_agent_node(state, config):
             "\n先阅读下面的普通检索参考；它们是工作解/方法提示，不是答案锁定。若检索相似度很高，"
             "复核其推导后尽量保持同一答案术语和语言；若相似度较低，只借方法并按本题重算。\n"
             f"{examples_text}{cards_text}\n"
-            + ("高相似度直供记录存在时，直接参考其原始题解和结论，不做模糊改写。\n"
+            + ("通过答案安全门槛的同题参考记录存在时，可参考其原始题解；仍须核对本题条件。\n"
                if high_similarity_context else "")
             + f"{contract}\n\n"
             f"题型：{question_mode}\n学科：{category}\n技能参考：\n"
             f"{select_skill_excerpt(skill_doc, problem, 2200)}\n\n"
-            "若参考示例标为‘高相似度直供’，仍须在本题条件上做最后核对；"
-            "先在本题选项/条件上独立核对，再输出本题答案，不要使用任何近似题结论。\n\n"
+            "只有明确通过答案安全门槛的同题参考，才可参考其完整解答；其他近似题只能借方法。"
+            "仍须在本题选项/条件上独立核对，再输出本题答案，不要迁移近似题结论。\n\n"
             f"题目：\n{problem}"
         )
         objective_recovery_base = base_prompt + (

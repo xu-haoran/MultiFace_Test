@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import re
 
+from utils.retrieval_relation import answer_reuse_safety
+
 #: 解答文本里的结论标记，按可靠性从高到低。多语种：题库含克罗地亚语/西班牙语等。
 _ANSWER_PATTERNS = (
     re.compile(r"\\boxed\s*\{([^{}]{1,120}(?:\{[^{}]*\}[^{}]*)?)\}"),
@@ -76,12 +78,18 @@ def db_fallback_answer(state: dict) -> tuple[str, float, str]:
         if not isinstance(example, dict):
             continue
         try:
-            similarity = float(example.get("similarity") or 0.0)
+            similarity = float(example.get("dense_similarity") or 0.0)
         except (TypeError, ValueError):
             similarity = 0.0
         if similarity <= HIGH_SIMILARITY_ANSWER_MIN:
             continue
-        if str(example.get("relation") or "") != "high_similarity":
+        safe, _ = answer_reuse_safety(
+            str((state or {}).get("problem") or ""),
+            example,
+            high_similarity_min=float(example.get("high_similarity_min", 0.85) or 0.85),
+        )
+        if (str(example.get("relation") or "") != "high_similarity"
+                or example.get("answer_safe") is not True or not safe):
             continue
         conclusion = extract_reference_conclusion(example.get("solution", ""))
         if conclusion and similarity > best[1]:

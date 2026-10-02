@@ -12,7 +12,11 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 from config import CONFIG
 from utils.deps import get_deps
 from utils.logger import get_logger
-from utils.retrieval_relation import annotate_candidates, select_for_injection
+from utils.retrieval_relation import (
+    annotate_candidates,
+    dense_similarity_score,
+    select_for_injection,
+)
 from utils.hybrid_retriever import HybridRetriever
 from utils.knowledge_card_retriever import KnowledgeCardRetriever
 
@@ -24,18 +28,19 @@ _RETRIEVAL_DB_LOCK = threading.RLock()
 def database_retrieval_node(state: Dict[str, Any], config: Dict) -> Dict[str, Any]:
     """Query ChromaDB for the top-k similar problems+solutions as reference examples.
 
-    The retriever recalls a larger candidate set, then applies three relation
-    bands. A retrieval similarity strictly above
-    ``CONFIG["db_high_similarity"]`` is injected with its complete problem and
-    solution (at most one); related records are method-only references (at most
-    ``db_related_inject_k``), and irrelevant records remain trace-only. The
-    selected examples are shared by the reasoning and Python agents.
+    The retriever recalls a larger candidate set, then applies relation bands
+    using dense similarity only. A high-similarity label does not itself permit
+    answer reuse: the normalized problem must match exactly and an answer must
+    be present. Related records and sparse-only lexical matches are method-only
+    references and cannot enter the dense-similarity bands.
 
     Returns:
         Dict with 'retrieved_examples': List[Dict] containing:
             - problem: original problem text
             - solution: solution text
-            - similarity: retrieval similarity score (dense or sparse fallback)
+            - dense_similarity: cosine similarity, when dense retrieval found it
+            - sparse_similarity: lexical score, when sparse retrieval found it
+            - hybrid_score: fused ranking score, never used as a similarity
             - source: source file path
     """
     # 检索是纯增益节点：任何失败都必须降级为"无参考示例"，绝不能打断求解子图。
@@ -97,8 +102,13 @@ def database_retrieval_node(state: Dict[str, Any], config: Dict) -> Dict[str, An
             related_limit=int(CONFIG.get("db_related_inject_k", 3) or 3),
         )
         for i, r in enumerate(candidates):
+            dense_score = dense_similarity_score(r)
+            sparse_score = r.get("sparse_similarity")
             logger.info(
-                f"[db_retrieval] recall#{i+1} sim={r.get('similarity', 0.0):.3f} "
+                f"[db_retrieval] recall#{i+1} dense="
+                f"{f'{dense_score:.3f}' if dense_score is not None else 'n/a'} "
+                f"sparse={f'{float(sparse_score):.3f}' if sparse_score is not None else 'n/a'} "
+                f"hybrid={r.get('hybrid_score') if r.get('hybrid_score') is not None else 'n/a'} "
                 f"relation={r.get('relation', '')} dataset={r.get('source_dataset', '')} "
                 f"src={r.get('source', '')[:60]}"
             )
@@ -106,7 +116,7 @@ def database_retrieval_node(state: Dict[str, Any], config: Dict) -> Dict[str, An
         # 不锁定答案；关系标签只用于安全筛选和 trace。
         relation_counts = {
             name: sum(1 for item in candidates if item.get("relation") == name)
-            for name in ("high_similarity", "related", "irrelevant")
+            for name in ("high_similarity", "related", "sparse_reference", "irrelevant")
         }
         logger.info(
             f"[db_retrieval] recalled={len(candidates)} injected={len(examples)} "
@@ -118,6 +128,7 @@ def database_retrieval_node(state: Dict[str, Any], config: Dict) -> Dict[str, An
             "retrieval_relation_summary": {
                 "recalled": len(candidates),
                 "injected": len(examples),
+                "answer_safe": sum(1 for item in candidates if item.get("answer_safe") is True),
                 "counts": relation_counts,
                 "fallback": False,
                 "hybrid": hybrid_used,
@@ -146,18 +157,35 @@ def database_retrieval_node(state: Dict[str, Any], config: Dict) -> Dict[str, An
         return result
 
     except Exception as e:
-        # 关系层失败时回退到旧的 top-2 检索。
+        # 异常回退仍经过同一关系分档和答案安全门槛。
         logger.error(f"[db_retrieval] relation-aware retrieval error: {e!r}")
         try:
             with _RETRIEVAL_DB_LOCK:
-                fallback = deps.db_client.query(
+                raw_fallback = deps.db_client.query(
                     problem, top_k=int(CONFIG.get("db_retrieval_top_k", 2) or 2))
+            fallback_candidates = annotate_candidates(
+                problem,
+                raw_fallback,
+                high_similarity_min=float(CONFIG.get("db_high_similarity", 0.85)),
+                related_min_similarity=float(CONFIG.get("db_related_similarity", 0.70)),
+            )
+            fallback_examples = select_for_injection(
+                fallback_candidates,
+                related_limit=int(CONFIG.get("db_related_inject_k", 3) or 3),
+            )
             return {
-                "retrieved_examples": fallback,
-                "retrieval_candidates": fallback,
+                "retrieved_examples": fallback_examples,
+                "retrieval_candidates": fallback_candidates,
                 "retrieval_relation_summary": {
-                    "recalled": len(fallback), "injected": len(fallback),
-                    "counts": {}, "fallback": True,
+                    "recalled": len(fallback_candidates), "injected": len(fallback_examples),
+                    "answer_safe": sum(1 for item in fallback_candidates
+                                       if item.get("answer_safe") is True),
+                    "counts": {
+                        name: sum(1 for item in fallback_candidates
+                                  if item.get("relation") == name)
+                        for name in ("high_similarity", "related", "sparse_reference", "irrelevant")
+                    },
+                    "fallback": True,
                 },
             }
         except Exception as fallback_error:

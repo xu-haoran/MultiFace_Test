@@ -102,26 +102,32 @@ class ReasoningAgent:
                                "示例注入推理与验证两个子代理。",
                     "relation_thresholds": {
                         "high_similarity": {
-                            "condition": f"similarity > {high_threshold:.2f}",
-                            "injection": "完整题面和参考解答",
+                            "condition": f"dense_similarity > {high_threshold:.2f}",
+                            "injection": "无论题面规范化是否一致，均注入最高排名的一条完整参考解；答案复用仍由 answer_safe 独立限制",
                             "max_injected": 1,
                         },
                         "related": {
                             "condition": (
-                                f"{related_threshold:.2f} < similarity <= "
+                                f"{related_threshold:.2f} < dense_similarity <= "
                                 f"{high_threshold:.2f}"
                             ),
-                            "injection": "方法参考，隐藏具体结论/答案/数值",
+                            "injection": "仅作解题过程参考；文本启发式过滤，要求按当前题独立推导",
+                            "max_injected": related_limit,
+                        },
+                        "sparse_reference": {
+                            "condition": "dense_similarity unavailable and sparse_similarity > 0",
+                            "injection": "仅作关键词命中的方法参考，不提供答案",
                             "max_injected": related_limit,
                         },
                         "irrelevant": {
-                            "condition": f"similarity <= {related_threshold:.2f}",
+                            "condition": f"dense_similarity <= {related_threshold:.2f} or unavailable",
                             "injection": "不注入，仅保留检索轨迹",
                             "max_injected": 0,
                         },
                     },
                     "selection_policy": (
-                        "有 high_similarity 时只注入最高的一条；否则注入最高的 related 记录"
+                        "优先注入排名最高的一条 high_similarity 完整参考解，不以 answer_safe 决定是否展示；"
+                        "没有 high_similarity 时，related/关键词候选仅作方法参考"
                         f"（最多 {related_limit} 条）"
                     ),
                     "reference_block_chars": {
@@ -146,10 +152,20 @@ class ReasoningAgent:
                     "results": [
                         {
                             "rank": i,
-                            "similarity": ex.get("similarity", 0.0),
+                            "dense_similarity": ex.get("dense_similarity"),
+                            "sparse_similarity": ex.get("sparse_similarity"),
+                            "hybrid_score": ex.get("hybrid_score"),
                             "relation": ex.get("relation", ""),
                             "relation_reason": ex.get("relation_reason", ""),
+                            "answer_safe": ex.get("answer_safe", False),
+                            "answer_safety_reason": ex.get("answer_safety_reason", ""),
                             "injected": id(ex) in injected_items,
+                            "reference_injection_mode": (
+                                "full_reference" if id(ex) in injected_items
+                                and ex.get("relation") == "high_similarity"
+                                else "method_only" if id(ex) in injected_items
+                                else "none"
+                            ),
                             "changed_parameters": ex.get("changed_parameters", []),
                             "problem_chars": len(str(ex.get("problem") or "")),
                             "solution_chars": len(str(ex.get("solution") or "")),
@@ -341,6 +357,7 @@ class ReasoningAgent:
                 ],
             })
         if state.get("final_response"):
+            vote = state.get("coordination_vote_summary") or {}
             trace.append({
                 "step": "coordination",
                 "source": "src/nodes/coordinator_node.py::coordinator_node",
@@ -353,6 +370,14 @@ class ReasoningAgent:
                         "name": "coordinator_llm",
                         "content_length": len(state.get("coordination_detail", "")),
                         "skipped_for_locked_answer": bool(state.get("answer_locked")),
+                        "vote": {
+                            "requested": vote.get("requested", 0),
+                            "attempted": vote.get("attempted", 0),
+                            "valid_candidates": vote.get("valid_candidates", 0),
+                            "majority": vote.get("majority", False),
+                            "selection": vote.get("selection", "not_run"),
+                            "reference_review": vote.get("reference_review", "not_run"),
+                        },
                     },
                     {
                         "name": "answer_formatter",
