@@ -23,6 +23,7 @@ from utils.objective_verifier import (
     objective_answers_equal,
 )
 from config import CONFIG
+from utils.flow_policy import candidate_complete
 
 
 def _clean_answer(answer: str) -> str:
@@ -91,6 +92,9 @@ def _preferred_answer(state: dict, match_result: dict) -> str:
         python_answer = ""
     python_ok = bool(po.get("success")) and bool(python_answer)
     reasoning_ok = bool(reasoning_answer) and not looks_incomplete_answer(reasoning_answer)
+    if po.get("evidence_status") == "contradict" and python_ok and candidate_complete(
+            problem, python_answer, question_mode) and not _same_scalar_or_text(python_answer, reasoning_answer):
+        return normalize_objective_answer(python_answer, question_mode) if is_objective_mode(question_mode) else python_answer
     if is_objective_mode(question_mode):
         # 所有降级路径都保持规范答案格式，不能返回原始推理散文。
         for candidate in (reasoning_answer, python_answer):
@@ -99,13 +103,6 @@ def _preferred_answer(state: dict, match_result: dict) -> str:
                 return normalized
         return ""
     # 高相似例题只作为推理参考，不提取或锁定答案；冲突时按验证证据选择。
-    has_high_similarity_worked_example = any(
-        isinstance(item, dict) and item.get("answer_safe") is True
-        for item in (state.get("retrieved_examples") or [])
-    )
-    if has_high_similarity_worked_example and reasoning_ok:
-        return reasoning_answer
-
     # 证据优先的最后防线：Python 证据明确反驳推理候选、且 Python 自己持有一个
     # 不同的、可用的、非伪造的答案时，兜底必须选 Python——被自家验证器反驳的
     # 答案不得再被输出。仅在此条件下打破"推理优先"，避免污染无争议路径。
@@ -138,10 +135,22 @@ def _preferred_answer(state: dict, match_result: dict) -> str:
 
 
 def cross_validator_node(state, config):
+    # Normalize once per pass; review is an optional check inside validation.
+    from nodes.normalize_candidates_node import normalize_candidates_node
+    from nodes.knowledge_review_node import knowledge_review_node
+    normalized = normalize_candidates_node(state, config)
+    state = {**state, **normalized}
+    reviewed = knowledge_review_node(state, config)
+    state = {**state, **reviewed}
+    result = _validate_candidates(state, config)
+    return {**normalized, **reviewed, **result}
+
+
+def _validate_candidates(state, config):
     reasoning_result = state.get("reasoning_result") or {}
     raw_python_output = state.get("python_output") or {}
     question_mode = state.get("question_mode") or classify_question_mode(state.get("problem", ""))
-    python_output = parse_verification_evidence(
+    python_output = raw_python_output if "python_verification_trusted" in raw_python_output else parse_verification_evidence(
         raw_python_output,
         candidate_answer=("" if is_objective_mode(question_mode)
                           else reasoning_result.get("answer", "")),
@@ -157,6 +166,7 @@ def cross_validator_node(state, config):
         # 未通过独立性校验的程序结果只作诊断，不参与共识。
         python_independent = bool(
             python_output.get("objective_independent")
+            and python_answer_is_trusted(python_output)
             and objective_code_is_independent(
                 state.get("python_code", ""), question_mode)
         )
@@ -230,7 +240,8 @@ def cross_validator_node(state, config):
         match_result = dict(AnswerMatcher.match_answers(
             problem=state["problem"],
             reasoning_result=reasoning_result,
-            python_result=python_output,
+            python_result=(python_output if python_answer_is_trusted(python_output)
+                           else {**python_output, "answer": "", "success": False}),
         ))
     evidence_status = python_output.get("evidence_status", "inconclusive")
     evidence_summary = python_output.get("evidence_summary", "")
@@ -253,10 +264,73 @@ def cross_validator_node(state, config):
         "contradictions": contradictions[:10],
     }
 
+    health = state.get("candidate_health") or {}
+    review = state.get("knowledge_review") or {}
+    if review.get("status") == "ambiguous":
+        match_result.update({"routing_reason": "knowledge_ambiguity", "knowledge_review": review})
+        return {"validation_status": "uncertain_arbitrating", "validation_details": match_result,
+                "next_node": "semantic_arbiter", "validated_answer": "",
+                "validation_history": [{**history_entry, "status": "uncertain_arbitrating"}]}
+    if evidence_status != "contradict" and review.get("status") == "supported" and candidate_complete(
+            state.get("problem", ""), review.get("answer", ""), question_mode):
+        match_result.update({"status": "match", "method": "source_based_semantic_review",
+                             "knowledge_review": review, "routing_reason": "knowledge_sources_support_candidate"})
+        return {"validation_status": "match", "validation_details": match_result,
+                "validated_answer": review["answer"], "answer_locked": True,
+                "next_node": "coordinator", "validation_history": [
+                    {**history_entry, "status": "match", "knowledge_review": review}]}
+    semantic = python_output.get("semantic_candidate", "")
+    if is_objective_mode(question_mode) and semantic and candidate_complete(
+            state.get("problem", ""), semantic, question_mode) and not objective_answers_equal(
+                semantic, reasoning_result.get("answer", ""), question_mode):
+        match_result.update({"routing_reason": "unverified_knowledge_conflict",
+                             "knowledge_review": review})
+        return {"validation_status": "uncertain_arbitrating", "validation_details": match_result,
+                "next_node": "semantic_arbiter", "validated_answer": "",
+                "validation_history": [{**history_entry, "status": "uncertain_arbitrating"}]}
+    reasoning_ok = health.get("reasoning", False)
+    python_ok = health.get("python", False)
+    python_enabled = state.get("python_verification_enabled", True)
+    # A deliberately omitted program is not a failed branch. Keep uncertainty
+    # explicit; the coordinator may submit a complete sole candidate directly.
+    if evidence_status != "contradict" and not python_enabled and reasoning_ok:
+        match_result.update({"status": "uncertain", "routing_reason": "python_not_required",
+                             "method": "single_reasoning_candidate", "knowledge_review": review})
+        history_entry["status"] = "uncertain"
+        return {
+            "validation_status": "uncertain", "validation_details": match_result,
+            "validated_answer": reasoning_result.get("answer", ""),
+            "next_node": "coordinator", "validation_history": [history_entry],
+        }
+    # Repair technical/coverage failure on one side without regenerating the
+    # healthy candidate. A counterexample is a mathematical conflict instead.
+    target = "python" if reasoning_ok else "reasoning"
+    repair_state = {**state, "validation_details": {**match_result, "repair_target": target}}
+    if evidence_status != "contradict" and reasoning_ok != python_ok \
+            and (python_enabled or not reasoning_ok) \
+            and reconciliation_retry_available(repair_state, config):
+        match_result.update({"routing_reason": "single_branch_failure", "repair_target": target})
+        history_entry["status"] = "branch_repairing"
+        return {
+            "validation_status": "branch_repairing", "validation_details": match_result,
+            "validated_answer": "", "next_node": "reconciliation",
+            "retry_targets": [target], "validation_history": [history_entry],
+        }
+    # Equality cannot certify an answer that omits requested deliverables.
+    if status == "match" and not candidate_complete(
+            state.get("problem", ""), reasoning_result.get("answer", ""), question_mode):
+        status = "uncertain"
+        match_result["status"] = status
+        match_result["verdict"] = None
+        match_result["reason"] = "两分支答案一致，但未覆盖题面全部要求"
+        match_result["routing_reason"] = "matched_but_incomplete"
+
     # 反例证据优先于文本或符号一致；程序成功也可能证明候选错误。
     if evidence_status == "contradict":
         match_result["routing_reason"] = "python_evidence_contradiction"
-        if reconciliation_retry_available(state, config):
+        repair_state = {**state, "validation_details": {**match_result, "repair_target": "reasoning"}}
+        if python_ok and reconciliation_retry_available(repair_state, config):
+            match_result["repair_target"] = "reasoning"
             status = "mismatch_reconciling"
             next_node = "reconciliation"
         else:
@@ -273,6 +347,7 @@ def cross_validator_node(state, config):
             "python_evidence_status": evidence_status,
             "python_evidence_summary": evidence_summary,
             "python_contradictions": contradictions,
+            "retry_targets": ["reasoning"] if next_node == "reconciliation" else [],
             "validation_history": [history_entry],
         }
 
@@ -297,8 +372,12 @@ def cross_validator_node(state, config):
                 {**state, "python_output": python_output}, match_result)
         next_node = "coordinator"
     elif status == "mismatch":
+        if reasoning_ok and python_ok:
+            status = "mismatch_arbitrating"
+            next_node = "semantic_arbiter"
+            match_result["routing_reason"] = "complete_candidates_conflict"
         # 按整题 reconciliation_round 重试，与节点内部重试分开。
-        if reconciliation_retry_available(state, config):
+        elif reconciliation_retry_available(state, config):
             status = "mismatch_reconciling"
             next_node = "reconciliation"
         else:
@@ -306,6 +385,15 @@ def cross_validator_node(state, config):
             match_result["routing_reason"] = "mismatch_retry_exhausted_semantic_arbitration"
             next_node = "semantic_arbiter"
     else:  # uncertain
+        # A failed verifier creates no competing mathematical candidate. After
+        # the affordable targeted repair, submit the intact candidate directly.
+        if reasoning_ok != python_ok:
+            candidate = reasoning_result.get("answer", "") if reasoning_ok else python_output.get("answer", "")
+            match_result.update({"status": "uncertain", "routing_reason": "single_candidate_after_verification",
+                                 "method": "single_complete_candidate"})
+            return {"validation_status": "uncertain", "validation_details": match_result,
+                    "validated_answer": candidate, "next_node": "coordinator",
+                    "validation_history": [{**history_entry, "status": "uncertain"}]}
         # 解析不确定时先让语义仲裁选择已有候选，也允许弃权后重跑。
         status = "uncertain_arbitrating"
         match_result["routing_reason"] = "insufficient_equivalence_evidence_semantic_arbitration"

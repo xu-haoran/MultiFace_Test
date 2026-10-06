@@ -1,6 +1,6 @@
+import json
 import re
 import unicodedata
-from collections import Counter
 
 from utils.deps import get_deps
 from utils.answer_cleanliness import extract_partial_findings, is_noise_answer
@@ -20,11 +20,13 @@ from utils.retrieval_relation import answer_reuse_safety
 from utils.cot_stripper import is_placeholder_answer, strip_cot_prefix
 from utils.answer_extractor import looks_incomplete_answer
 from utils.llm_retry import chat_prefilled, chat_with_retry
-from utils.prompt_templates import COORDINATOR_PROMPT
+from utils.prompt_templates import COORDINATOR_PREFILL, COORDINATOR_PROMPT
 from utils.token_budget import estimate_tokens
 from utils.verification_evidence import python_answer_is_trusted
 from utils.reference_block import build_reference_block, _method_only_solution
+from utils.time_budget import CLOSEOUT_EMERGENCY_BUFFER_S
 from config import CONFIG
+from utils.flow_policy import candidate_complete, proof_process_present
 from utils.problem_profile import (
     fill_answer_matches_blanks,
     is_objective_mode,
@@ -146,9 +148,9 @@ def _database_reference_block(state: dict, limit: int = 2) -> str:
             lines.append(
                 f"\n[高度一致候选题：high_similarity；{reuse_status}；"
                 f"稠密相似度 {similarity:.3f}]\n"
-                f"题面：{str(example.get('problem') or '')[:600]}\n"
+                f"题面：{str(example.get('problem') or '')}\n"
                 f"使用边界：{use_boundary}\n"
-                f"完整解答：{str(example.get('solution') or example.get('reference_answer') or '')[:1200]}\n"
+                f"完整解答：{str(example.get('solution') or example.get('reference_answer') or '')}\n"
             )
             continue
         if relation == "related":
@@ -158,11 +160,11 @@ def _database_reference_block(state: dict, limit: int = 2) -> str:
         else:
             label = "关键词相关候选：仅供参考方法"
         entry = (f"\n[{label}；稠密相似度 {similarity:.3f}]\n"
-                 f"题面：{str(example.get('problem') or '')[:600]}\n")
+                 f"题面：{str(example.get('problem') or '')}\n")
         entry += (
             "不要把参考题的答案、结论或参数当作本题内容；仅借鉴解题思路，"
             "并按当前题条件独立推导：\n"
-            f"{_method_only_solution(str(example.get('solution') or ''), 600)}\n"
+            f"{_method_only_solution(str(example.get('solution') or ''))}\n"
         )
         lines.append(entry)
     if not lines:
@@ -214,14 +216,14 @@ def _clean_high_similarity_worked_answer(answer: str, state: dict) -> str:
     return text
 
 
-def _coordinator_vote_key(answer: str, problem_type: str, question_mode: str) -> str:
-    """把格式化答案转成保守的投票键，不做数学等价猜测。"""
+def _coordinator_result_key(answer: str, problem_type: str, question_mode: str) -> str:
+    """生成保守的一致性比较键，不猜测数学等价。"""
     if is_objective_mode(question_mode):
         return normalize_objective_answer(answer, question_mode)
 
     text = str(answer or "").strip()
     if problem_type == "proof" and "\n\n" in text:
-        # 证明题按结论投票，保留被选中候选的完整证明正文。
+        # 证明题按结论做一致性比较，同时保留完整证明正文。
         text = text.split("\n\n", 1)[0].strip()
     text = _strip_answer_label(text)
     text = unicodedata.normalize("NFKC", text)
@@ -233,17 +235,107 @@ def _coordinator_vote_key(answer: str, problem_type: str, question_mode: str) ->
     return text.strip(" \t\r\n$`。．;；")
 
 
-def _coordinator_vote_candidate(raw: str, problem_type: str, question_mode: str,
-                                problem: str) -> dict | None:
-    """抽取并格式化一次协调器结果；无效答案不进入投票。"""
+def _json_string_field(text: str, field: str) -> str:
+    """从完整或截断的协调器 JSON 中提取字符串字段。"""
+    match = re.search(
+        rf'"{re.escape(field)}"\s*:\s*("(?:\\.|[^"\\])*")',
+        text,
+        re.DOTALL,
+    )
+    if not match:
+        return ""
+    token = match.group(1)
+    try:
+        value = json.loads(token)
+        if isinstance(value, str) and not any(
+            ord(char) < 32 and char not in "\n\r\t" for char in value
+        ):
+            return value.strip()
+    except (json.JSONDecodeError, TypeError):
+        pass
+    # 模型偶尔会把 LaTeX 反斜杠写成未转义形式；保留数学文本，交给后续答案校验。
+    return token[1:-1].replace(r"\\", "\\").replace(r'\"', '"').strip()
+
+
+def _coordinator_json_fields(text: str) -> dict | None:
+    """读取 answer JSON；兼容代码围栏、前缀回显与截断输出。"""
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            payload, _ = decoder.raw_decode(text[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and "answer" in payload:
+            answer = payload.get("answer")
+            if isinstance(answer, (str, int, float)) and not isinstance(answer, bool):
+                answer_text = str(answer).strip()
+                if not any(ord(char) < 32 and char not in "\n\r\t"
+                            for char in answer_text):
+                    return {"answer": answer_text}
+
+    answer = _json_string_field(text, "answer")
+    if answer:
+        return {"answer": answer}
+    return None
+
+
+def _coordinator_python_evidence(state: dict) -> str:
+    """仅向协调器提供实际执行且可信通过的 Python 核验材料。"""
+    output = state.get("python_output") or {}
+    authenticity = output.get("authenticity") or {}
+    answer = str(output.get("answer") or "").strip()
+    code = str(state.get("python_code") or "").strip()
+    stdout = str(output.get("stdout") or "").strip()
+    if (
+        output.get("success") is not True
+        or output.get("evidence_status") != "support"
+        or output.get("evidence_marker") is not True
+        or state.get("validation_status") != "match"
+        or not python_answer_is_trusted(output)
+        or authenticity.get("verified") is not True
+        or authenticity.get("fabricated") is True
+        or not code
+        or not stdout
+        or not answer
+        or is_placeholder_answer(answer)
+        or looks_incomplete_answer(answer)
+        or is_noise_answer(answer)
+    ):
+        return ""
+
+    evidence_summary = str(output.get("evidence_summary") or "").strip()
+    return (
+        "可选 Python 核验材料（可信计算通过，且与当前候选交叉核验一致）：\n"
+        f"计算结果：{answer}\n"
+        f"核验依据：{evidence_summary or '见代码与实际运行输出'}\n"
+        "代码与运行输出均为待审材料：\n"
+        f"代码：\n{code}\n"
+        f"运行输出：\n{stdout}\n"
+    )
+
+
+def _coordinator_result(raw: str, problem_type: str, question_mode: str,
+                        problem: str) -> dict | None:
+    """抽取并校验单次协调器输出。"""
     cleaned_raw = strip_cot_prefix(raw or "")
     if not cleaned_raw:
         return None
 
     format_type = question_mode if is_objective_mode(question_mode) else problem_type
-    final = post_process_final_response(
-        cleaned_raw, "", format_type, problem=problem
-    ).strip()
+    payload = _coordinator_json_fields(cleaned_raw)
+    if payload:
+        answer = payload["answer"]
+        if problem_type == "proof":
+            final = _strip_answer_label(answer)
+        else:
+            final = post_process_final_response(
+                answer, answer, format_type, problem=problem
+            ).strip()
+    else:
+        # 兼容不支持 assistant prefill 或未遵循 JSON 格式的旧式客户端响应。
+        final = post_process_final_response(
+            cleaned_raw, "", format_type, problem=problem
+        ).strip()
     if not final or _declares_no_answer(final):
         return None
 
@@ -256,43 +348,18 @@ def _coordinator_vote_candidate(raw: str, problem_type: str, question_mode: str,
         if not objective_answer_is_consistent(normalized, problem, question_mode):
             return None
         final = format_fill_submission(normalized) if question_mode == "fill" else normalized
-        key = normalize_objective_answer(final, question_mode)
     elif problem_type == "proof":
         conclusion = final.split("\n\n", 1)[0].strip()
         if (not conclusion or is_placeholder_answer(conclusion)
                 or _declares_no_answer(conclusion) or is_noise_answer(conclusion)
                 or looks_incomplete_answer(conclusion)):
             return None
-        key = _coordinator_vote_key(final, problem_type, question_mode)
     else:
         if (is_placeholder_answer(final) or is_noise_answer(final)
                 or looks_incomplete_answer(final)):
             return None
-        key = _coordinator_vote_key(final, problem_type, question_mode)
 
-    if not key:
-        return None
-    return {"final": final, "key": key, "cleaned_raw": cleaned_raw}
-
-
-def _select_coordinator_vote(candidates: list[dict], validated: str,
-                             problem_type: str, question_mode: str) -> tuple[dict | None, str]:
-    """多数优先；无多数时只取可用候选，优先与现有验证答案一致。"""
-    counts = Counter(candidate["key"] for candidate in candidates)
-    majority_key, majority_count = counts.most_common(1)[0] if counts else ("", 0)
-    if majority_count >= 2:
-        return next(c for c in candidates if c["key"] == majority_key), "majority"
-
-    if validated:
-        validated_key = _coordinator_vote_key(validated, problem_type, question_mode)
-        matching = [candidate for candidate in candidates if candidate["key"] == validated_key]
-        if matching:
-            return matching[0], "validated_consistent_candidate"
-        return None, "validated_answer_no_majority"
-
-    if candidates:
-        return candidates[0], "first_valid_without_majority"
-    return None, "no_valid_candidate"
+    return {"final": final, "cleaned_raw": cleaned_raw}
 
 
 def _partial_response(state: dict) -> tuple[str, str]:
@@ -332,9 +399,13 @@ def _emergency_direct_answer(state: dict, deps) -> str:
     模型基于题面与已获线索给出最可信结论。失败或产出噪声时返回 ""。
     """
     clock = deps.time_budget
-    quota = CONFIG.get("emergency_reserve_quota_s", 90)
-    if clock and clock.remaining_hard() < quota:
-        return ""
+    if clock:
+        if not clock.closeout_started():
+            return ""
+        if clock.remaining_hard() < CLOSEOUT_EMERGENCY_BUFFER_S:
+            return ""
+        if not clock.claim_closeout_attempt("emergency_answer"):
+            return ""
     rr = state.get("reasoning_result") or {}
     clues = []
     salvaged = salvage_conclusion(rr.get("analysis", ""))
@@ -358,7 +429,7 @@ def _emergency_direct_answer(state: dict, deps) -> str:
     prompt = (
         "下面这道数学题此前的求解未能完成。请你根据题目（和已有线索）直接给出最可能的"
         "最终答案：单行、具体（数值/表达式/集合/结论），不要解释过程，不要说无法确定。\n\n"
-        f"题目：\n{state.get('problem', '')[:6000]}\n{clue_block}{reference_block}"
+        f"题目：\n{state.get('problem', '')}\n{clue_block}{reference_block}"
     )
     try:
         raw = chat_prefilled(
@@ -368,6 +439,8 @@ def _emergency_direct_answer(state: dict, deps) -> str:
             # 应急答案只负责从已有证据中收束结论，尽量避免再次随机猜测。
             temperature=CONFIG["temperatures"].get("emergency_answer", 0.1),
             max_tokens=CONFIG["max_tokens"].get("emergency_answer", 1280),
+            top_p=CONFIG["top_p"]["emergency_answer"],
+            top_k=CONFIG["top_k"]["emergency_answer"],
             logger=deps.logger,
             time_budget=clock,
             expected_call_seconds=30,
@@ -403,6 +476,9 @@ def coordinator_node(state, config):
     validated = _strip_answer_label(validated)
     ptype = (state.get("validation_details") or {}).get("problem_type", "computation")
     question_mode = state.get("question_mode", ptype)
+    evidence_note = ""
+    if not state.get("answer_locked") and state.get("semantic_arbiter_decision") != "reasoning":
+        validated, evidence_note = _evidence_override(state, validated)
     if not is_objective_mode(question_mode):
         validated = _clean_high_similarity_worked_answer(validated, state)
     if question_mode == "fill" and validated and not fill_answer_matches_blanks(
@@ -414,11 +490,7 @@ def coordinator_node(state, config):
         validated, state.get("problem", ""), "fill"
     ):
         validated = ""
-    has_high_similarity_worked_example = any(
-        isinstance(item, dict) and item.get("answer_safe") is True
-        for item in (state.get("retrieved_examples") or [])
-    )
-    if is_objective_mode(question_mode) and validated and not has_high_similarity_worked_example:
+    if is_objective_mode(question_mode) and candidate_complete(state.get("problem", ""), validated, question_mode):
         # 客观题已有规范短答案，不再生成叙述，避免丢失选项或空格。
         if question_mode == "fill":
             submitted = format_fill_submission(validated)
@@ -426,19 +498,14 @@ def coordinator_node(state, config):
                 validated = submitted
         # 2026-08-24：客观题只放选项/对错/填空结果本身，不再加"最终答案："前缀。
         return {"final_response": validated, "coordination_detail": "",
-                "fallback_source": "objective_validated_answer"}
-    if is_objective_mode(question_mode) and validated and has_high_similarity_worked_example:
-        # 用一次普通调用对照参考例题复核候选，不读取标准答案字段。
-        deps.logger.info("Reviewing objective candidate against ordinary worked example")
+                "fallback_source": evidence_note or "objective_candidate_direct"}
     # 证据优先最终闸门：被自家验证器反驳的答案不得出厂（评委建议 1）。
     # 仲裁明确锁定的选择（answer_locked）尊重仲裁；未锁定的候选一律过闸。
     # 2026-08-16 idx=11：仲裁已读完双方证据仍选择推理分支（selected_unresolved，
     # 因交叉验证"矛盾未决"无法锁定），协调器闸门随后用 Python 分支的错误答案
     # 覆盖了仲裁的显式选择——闸门是为"仲裁超时/跳过"设计的，仲裁在场时不得推翻它。
-    evidence_note = ""
     if not state.get("answer_locked") \
             and state.get("semantic_arbiter_decision") != "reasoning":
-        validated, evidence_note = _evidence_override(state, validated)
         # 洁净度终门（2026-08-09 冒烟 idx 43）：交叉验证在双分支皆弱时可能放行一段
         # 探索散文；deadline 路径会把它原样出厂。修复优先于丢弃——"1/2 works." 这类
         # 正确值+口癖要剥尾保值（idx 2），修不出干净头部才置空。仲裁锁定的选择不经
@@ -450,22 +517,16 @@ def coordinator_node(state, config):
                 "kept clean head" if repaired else "dropping", validated,
             )
             validated = repaired
-    if state.get("answer_locked") and validated:
-        # 仲裁已选择现有候选，保持原文，不再改写或截短。
-        # 2026-08-24：选中的答案原样出厂（已剥标签），不再追加"关键步骤"大纲；
-        # 步骤经 reasoning_result/coordination_detail 留在 trace。
-        final = validated
-        if state.get("semantic_arbiter_decision") == "reasoning" and ptype == "proof":
-            # 证明题按 §6.2 判"结论+必要过程"：关键蕴含链必须写入
-            # final_response 而非仅存 trace（评委建议 10，idx 74 仅得 0.3）。
-            final = build_proof_body(final, rr)
-        return {"final_response": final, "coordination_detail": "",
-                "fallback_source": "validated_answer"}
-
+    proof_final = build_proof_body(validated, rr) if ptype == "proof" else validated
+    proof_has_process = ptype != "proof" or proof_process_present(validated, rr)
+    if candidate_complete(state.get("problem", ""), validated, question_mode) and proof_has_process:
+        return {"final_response": proof_final, "coordination_detail": "",
+                "fallback_source": evidence_note or "complete_candidate_direct",
+                "coordination_summary": {"generation": "not_needed", "selection": "complete_candidate",
+                                         "candidate_valid": True, "reference_review": "disabled"}}
     # 时间紧张时直接输出已有答案；证明题只要有时间仍保留推导过程。
     time_budget = deps.time_budget
-    out_of_time = bool(time_budget) and (
-        time_budget.expired() or (ptype != "proof" and time_budget.fast_path()))
+    out_of_time = bool(time_budget) and time_budget.closeout_started()
     if out_of_time and validated:
         final = validated
         # 证明正文已在状态中，不额外消耗模型调用。
@@ -507,158 +568,131 @@ def coordinator_node(state, config):
         problem_type_label=problem_type_label,
         reasoning_steps_formatted=steps_fmt,
         reasoning_analysis=rr.get("analysis", ""),
-        python_code=state.get("python_code", ""),
-        python_output=(state.get("python_output") or {}).get("stdout", ""),
-        validation_status=state.get("validation_status", ""),
+        python_evidence=_coordinator_python_evidence(state),
         validated_answer=validated,
         retrieval_reference=build_reference_block(
-            state.get("retrieved_examples"), problem_chars=700,
-            solution_chars=1000, problem=state.get("problem", "")),
+            state.get("retrieved_examples"), problem=state.get("problem", "")),
     )
-    candidates = []
-    attempted = 0
-    failed_calls = 0
     expected_call_seconds = 60
-    vote_attempt_limit = max(1, int(CONFIG.get("coordinator_vote_attempts", 3)))
-    for vote_number in range(1, vote_attempt_limit + 1):
-        if time_budget and not time_budget.can_afford(expected_call_seconds):
-            break
-        attempted += 1
+    summary = {
+        "generation": "not_run",
+        "candidate_valid": False,
+        "selection": "not_run",
+        "reference_review": "not_run",
+        "format": "json_prefill",
+    }
+    candidate = None
+    if time_budget and not time_budget.can_afford(expected_call_seconds):
+        summary["generation"] = "skipped_budget"
+    else:
+        raw = ""
         try:
-            raw = chat_with_retry(
+            raw = chat_prefilled(
                 client,
                 messages=[{"role": "user", "content": prompt}],
+                prefix=COORDINATOR_PREFILL,
                 temperature=CONFIG["temperatures"]["coordinator"],
                 max_tokens=CONFIG["max_tokens"]["coordinator"],
+                top_p=CONFIG["top_p"]["coordinator"],
+                top_k=CONFIG["top_k"]["coordinator"],
                 logger=deps.logger,
                 time_budget=time_budget,
                 expected_call_seconds=expected_call_seconds,
-                label=f"coordinator_vote_{vote_number}",
+                label="coordinator_prefill",
             )
-        except Exception as exc:  # noqa: BLE001 - one failed sample must not erase others.
-            failed_calls += 1
-            deps.logger.warning("Coordinator vote %s failed: %s", vote_number, exc)
-            continue
-        if budget:
-            budget.consume(estimate_tokens(prompt), estimate_tokens(raw or ""))
-        candidate = _coordinator_vote_candidate(
-            raw, ptype, question_mode, state.get("problem", "")
-        )
-        if candidate:
-            candidates.append(candidate)
+            if budget:
+                budget.consume(estimate_tokens(prompt), estimate_tokens(raw or ""))
+            candidate = _coordinator_result(
+                raw, ptype, question_mode, state.get("problem", "")
+            )
+            summary["generation"] = "completed_prefill" if candidate else "invalid_prefill"
+        except Exception as exc:  # noqa: BLE001 - retain existing safe fallbacks.
+            summary["generation"] = "prefill_failed"
+            deps.logger.warning("Coordinator prefilled call failed: %s", exc)
 
-    selected, selection = _select_coordinator_vote(
-        candidates, validated, ptype, question_mode
-    )
-    vote_summary = {
-        "requested": vote_attempt_limit,
-        "attempted": attempted,
-        "valid_candidates": len(candidates),
-        "failed_calls": failed_calls,
-        "majority": selection == "majority",
-        "selection": selection,
-    }
-    if selected is None:
+        # 后端若拒绝预填充格式，或预填充 JSON 无法解析，在预算允许时退回普通 JSON 调用。
+        if candidate is None and (
+            not time_budget or time_budget.can_afford(expected_call_seconds)
+        ):
+            try:
+                raw = chat_with_retry(
+                    client,
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=CONFIG["temperatures"]["coordinator"],
+                    max_tokens=CONFIG["max_tokens"]["coordinator"],
+                    top_p=CONFIG["top_p"]["coordinator"],
+                    top_k=CONFIG["top_k"]["coordinator"],
+                    logger=deps.logger,
+                    time_budget=time_budget,
+                    expected_call_seconds=expected_call_seconds,
+                    label="coordinator_plain_fallback",
+                )
+                if budget:
+                    budget.consume(estimate_tokens(prompt), estimate_tokens(raw or ""))
+                candidate = _coordinator_result(
+                    raw, ptype, question_mode, state.get("problem", "")
+                )
+                summary["generation"] = (
+                    "completed_plain_fallback" if candidate else "invalid_plain_fallback"
+                )
+            except Exception as exc:  # noqa: BLE001 - retain existing safe fallbacks.
+                summary["generation"] = "fallback_failed"
+                deps.logger.warning("Coordinator fallback call failed: %s", exc)
+        summary["candidate_valid"] = candidate is not None
+
+    if candidate and validated and candidate_complete(state.get("problem", ""), validated, question_mode) and _coordinator_result_key(
+            candidate["final"], ptype, question_mode
+    ) != _coordinator_result_key(validated, ptype, question_mode):
         deps.logger.warning(
-            "Coordinator voting found no selectable candidate (%s); using validated fallback",
-            selection,
+            "Coordinator answer conflicts with validated answer; keeping validated answer"
         )
+        candidate = None
+        summary["selection"] = "validated_answer"
+
+    if candidate is None:
         if validated:
             final = build_proof_body(validated, rr) if ptype == "proof" else validated
+            summary["selection"] = "validated_answer"
             return {
                 "final_response": final,
                 "coordination_detail": "",
-                "fallback_source": evidence_note or "validated_answer_no_majority",
-                "coordination_vote_summary": vote_summary,
+                "fallback_source": evidence_note or "validated_answer_coordinator_unavailable",
+                "coordination_summary": summary,
             }
         partial, source = _partial_response(state)
         guess = _emergency_direct_answer(state, deps)
         if guess:
+            summary["selection"] = "emergency_direct_answer"
             return {
                 "final_response": _with_emergency_answer(guess, partial, source),
                 "coordination_detail": "",
                 "fallback_source": "emergency_direct_answer",
-                "coordination_vote_summary": vote_summary,
+                "coordination_summary": summary,
             }
         db_final, db_source = _database_reference_fallback(state, deps)
         if db_final:
+            summary["selection"] = "database_reference"
             return {
                 "final_response": db_final,
                 "coordination_detail": "",
                 "fallback_source": db_source,
-                "coordination_vote_summary": vote_summary,
+                "coordination_summary": summary,
             }
+        summary["selection"] = source
         return {
             "final_response": partial,
             "coordination_detail": "",
             "fallback_source": source,
-            "coordination_vote_summary": vote_summary,
+            "coordination_summary": summary,
         }
 
-    final = selected["final"]
-    cleaned_raw = selected["cleaned_raw"]
-    # 声明式非答案闸门：叙述层在没拿到 validated_answer 时会写出"最终答案：无法
-    # 确定"（评委报告 idx 86），这必然判 0。只要还能找出一个具体候选就让位给它。
-    if _declares_no_answer(final):
-        deps.logger.warning("Coordinator narrative declared no answer; escalating to fallback")
-        guess = _emergency_direct_answer(state, deps)
-        if guess:
-            partial, source = _partial_response(state)
-            return {"final_response": _with_emergency_answer(guess, partial, source),
-                    "coordination_detail": cleaned_raw,
-                    "fallback_source": "emergency_direct_answer",
-                    "coordination_vote_summary": vote_summary}
-        db_final, db_source = _database_reference_fallback(state, deps)
-        if db_final:
-            return {"final_response": db_final, "coordination_detail": cleaned_raw,
-                    "fallback_source": db_source,
-                    "coordination_vote_summary": vote_summary}
-        partial, source = _partial_response(state)
-        if source != "generic_error":
-            return {"final_response": partial, "coordination_detail": cleaned_raw,
-                    "fallback_source": source,
-                    "coordination_vote_summary": vote_summary}
-        # 什么都没有：保留叙述本身——返回值规范要求非空可读字符串。
+    final = candidate["final"]
+    cleaned_raw = candidate["cleaned_raw"]
+    summary["selection"] = "coordinator_answer"
 
-    # 高相似参考复核仍可提供独立核对，但不能改写三次协调器投票选出的答案。
-    if (bool(CONFIG.get("high_similarity_worked_review_enabled", False))
-            and ptype != "proof" and not state.get("answer_locked")):
-        high_similarity_examples = [item for item in (state.get("retrieved_examples") or [])
-                                     if isinstance(item, dict) and item.get("answer_safe") is True]
-        if high_similarity_examples:
-            example = high_similarity_examples[0]
-            review_prompt = (
-                "请独立复核当前候选与题面、参考工作解是否一致。参考解来自检索到的普通工作示例，"
-                "不是标准答案字段。只输出一行‘最终答案：...’，不要解释。\n"
-                f"题目：\n{state.get('problem', '')}\n"
-                f"参考工作解：\n{str(example.get('solution') or '')[:2400]}\n"
-                f"当前候选：\n{final}"
-            )
-            try:
-                reviewed_raw = chat_prefilled(
-                    client,
-                    messages=[{"role": "user", "content": review_prompt}],
-                    prefix="最终答案：",
-                    temperature=0.0,
-                    max_tokens=768,
-                    logger=deps.logger,
-                    time_budget=time_budget,
-                    expected_call_seconds=35,
-                    label="high_similarity_worked_review",
-                )
-                reviewed = _coordinator_vote_candidate(
-                    reviewed_raw, ptype, question_mode, state.get("problem", "")
-                )
-                vote_summary["reference_review"] = (
-                    "agrees" if reviewed and reviewed["key"] == selected["key"]
-                    else "differs_or_invalid"
-                )
-            except Exception as exc:  # noqa: BLE001 - review never removes a voted answer.
-                vote_summary["reference_review"] = "unavailable"
-                deps.logger.warning("High-similarity worked-example review failed: %s", exc)
-
+    # 参考已参与求解；重复模型复核不改变输出，移出在线流程。
     # 2026-08-24 评委要求：计算/推导题 final_response 只含答案本身，关键步骤
     # 不再追加（完整解题说明已在 coordination_detail，进 trace 供核查）。
     return {"final_response": final, "coordination_detail": cleaned_raw,
-            "fallback_source": evidence_note or "coordinator_vote",
-            "coordination_vote_summary": vote_summary}
+            "fallback_source": evidence_note or "coordinator_answer",
+            "coordination_summary": summary}

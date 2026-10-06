@@ -99,8 +99,8 @@ _HIGH_RISK_CODE_RE = re.compile(
 def _baseline_evidence(code: str) -> tuple[bool, list[str]]:
     """Find an independently named small-instance comparison in Python code.
 
-    A PASS print is not a baseline.  The code must contain a real ``assert``
-    whose test is a comparison, and one side must look like an intentionally
+    A PASS print is not a baseline. The code must use an actual comparison in
+    an assertion or returned check, and one side must depend on an intentionally
     independent brute/exhaustive/small-case implementation.  AST inspection
     avoids treating comments or output strings as evidence.
     """
@@ -115,15 +115,30 @@ def _baseline_evidence(code: str) -> tuple[bool, list[str]]:
         for node in ast.walk(tree)
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     ]
-    has_compare_assert = any(
-        isinstance(node, ast.Assert) and isinstance(node.test, ast.Compare)
-        for node in ast.walk(tree)
-    )
     markers = ("brute", "naive", "enumerate", "exhaustive", "exact_small", "small_case")
     independent_names = sorted({
         name for name in names if any(marker in name for marker in markers)
     })
-    return has_compare_assert and bool(independent_names), independent_names
+    assignments = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assignments[target.id] = node.value
+    def uses_baseline(node, seen=None):
+        seen = set(seen or ())
+        if isinstance(node, ast.Name) and node.id in assignments and node.id not in seen:
+            return uses_baseline(assignments[node.id], seen | {node.id})
+        if isinstance(node, ast.Call):
+            name = node.func.attr if isinstance(node.func, ast.Attribute) else getattr(node.func, 'id', '')
+            if name.lower() in independent_names:
+                return True
+        return any(uses_baseline(child, seen) for child in ast.iter_child_nodes(node))
+    # Returned computed checks and assertions carry the same comparison. An
+    # unused function whose name happens to contain 'brute' is insufficient.
+    has_comparison = any(isinstance(node, ast.Compare) and uses_baseline(node)
+                         for node in ast.walk(tree))
+    return has_comparison and bool(independent_names), independent_names
 
 
 def _strip_comments_and_strings(code: str) -> tuple[str, str]:

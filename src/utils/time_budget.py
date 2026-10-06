@@ -1,4 +1,4 @@
-"""Per-problem wall-clock budget — the competition's hard constraint is time, not tokens.
+"""Per-problem wall-clock budget with a normal phase and a closeout phase.
 
 Why this exists (measured 2026-07-29 against intern-s2-preview-397b):
 
@@ -31,25 +31,24 @@ from threading import Lock
 from config import CONFIG
 
 
+# Keep this much of the closeout window for the emergency answer and finalization.
+CLOSEOUT_EMERGENCY_BUFFER_S = 90
+
+
 class TimeBudget:
     """Monotonic per-problem deadline shared by every node in one solve() call.
 
-    Three horizons:
-      * ``soft`` (total - reserve) — deadline for *optional* work. Past it the
-        graph stops paying for arbitration/coordination LLM calls and falls back
-        to deterministic answer selection.
-      * ``fast_path`` threshold — enough time left for one more full LLM call?
-        Below it, skip retries and second-chance stages.
-      * ``total`` — the platform's hard per-problem limit. Never intentionally
-        reached; the reserve is what keeps us clear of it.
+    Two phases:
+      * ``normal`` (total - reserve) — ordinary solving and verification.
+      * ``closeout`` (the reserve) — compressed reasoning and emergency answer.
     """
 
     def __init__(
         self,
         total_seconds: float | None = None,
         reserve_seconds: float | None = None,
-        fast_path_threshold: float | None = None,
         clock=time.monotonic,
+        sleeper=time.sleep,
     ) -> None:
         self.total = float(
             total_seconds if total_seconds is not None else CONFIG["problem_time_budget_s"]
@@ -57,15 +56,12 @@ class TimeBudget:
         self.reserve = float(
             reserve_seconds if reserve_seconds is not None else CONFIG["time_reserve_s"]
         )
-        self.fast_path_threshold = float(
-            fast_path_threshold
-            if fast_path_threshold is not None
-            else CONFIG["time_fast_path_threshold_s"]
-        )
         self._clock = clock
+        self._sleep = sleeper
         self._start = clock()
         self._lock = Lock()
         self._spend_log: list[dict] = []
+        self._closeout_claims: set[str] = set()
 
 
     def now(self) -> float:
@@ -90,24 +86,45 @@ class TimeBudget:
         return self.total - self.elapsed()
 
     def expired(self) -> bool:
+        """True once the normal-solving phase ends."""
         return self.remaining() <= 0
 
     def can_afford(self, seconds: float) -> bool:
         return self.remaining() >= float(seconds)
 
-    def fast_path(self) -> bool:
-        """True when there is no longer room for a full extra LLM round trip."""
-        return self.remaining() < self.fast_path_threshold
+    def closeout_started(self) -> bool:
+        """Whether the final reserved phase has begun."""
+        return self.remaining_hard() <= self.reserve
 
-    def timeout_for(self, ceiling: float | None) -> float | None:
+    def wait_until_closeout(self) -> bool:
+        """Wait until the reserved final phase; return whether it has begun."""
+        delay = max(0.0, self.total - self.reserve - self.elapsed())
+        if delay:
+            self._sleep(delay)
+        return self.closeout_started()
+
+    def claim_closeout_attempt(self, label: str) -> bool:
+        """Allow a named closeout action to run at most once per problem."""
+        with self._lock:
+            if label in self._closeout_claims:
+                return False
+            self._closeout_claims.add(label)
+            return True
+
+    def timeout_for(
+        self,
+        ceiling: float | None,
+        *,
+        normal_only: bool = False,
+        reserve_after: float = 0.0,
+    ) -> float | None:
         """Clamp a node's configured ceiling to what the deadline actually allows.
 
-        A node may never outlive the problem: a generous per-node ceiling catches
-        true hangs, while the deadline caps the real world. Returns a small
-        positive floor rather than 0 so an already-late node still gets a chance
-        to return the answer it has instead of raising.
+        A node may not outlive its phase. A zero allowance lets the wrapper move
+        directly to that node's deterministic fallback.
         """
-        allowed = max(1.0, self.remaining_hard())
+        available = self.remaining() if normal_only else self.remaining_hard() - reserve_after
+        allowed = max(0.0, available)
         if ceiling is None:
             return allowed
         return min(float(ceiling), allowed)
@@ -127,6 +144,6 @@ class TimeBudget:
             "remaining_s": round(self.remaining(), 2),
             "total_s": self.total,
             "reserve_s": self.reserve,
-            "fast_path": self.fast_path(),
+            "closeout_started": self.closeout_started(),
         }
 

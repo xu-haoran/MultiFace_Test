@@ -28,6 +28,17 @@ def _error_payload(node: str, exc: Exception) -> dict:
 def _fallback_for_node(node: str, state: dict, error: dict, config: dict | None = None) -> dict:
     base = {"errors": [error]}
     if node == "classifier":
+        from nodes.classifier_node import _deterministic_fallback, _decision_payload, _rank_alternate_categories
+        try:
+            deps = get_deps(config)
+            sl = deps.skills_loader
+            categories = list(sl.categories)
+            problem = state.get("problem", "")
+            category = _deterministic_fallback(sl, problem, categories, deps.logger)
+            return {**base, **_decision_payload(problem, categories, category, 0.0,
+                    _rank_alternate_categories(sl, problem, category, categories), ["timeout_deterministic_fallback"])}
+        except Exception:
+            pass
         return {
             **base,
             "category": "非基础及进阶课程",
@@ -42,7 +53,6 @@ def _fallback_for_node(node: str, state: dict, error: dict, config: dict | None 
                 "analysis": "",
                 "steps": [],
                 "answer": "",
-                "validation_points": [],
             },
             "reasoning_trace": [{"attempt": 0, "status": "failed", "error": error["message"]}],
             "reasoning_attempts": 0,
@@ -94,10 +104,9 @@ def _fallback_for_node(node: str, state: dict, error: dict, config: dict | None 
         from utils.reconciliation_policy import reconciliation_retry_available
 
         can_retry = False
-        try:
-            can_retry = bool(config) and reconciliation_retry_available(state, config)
-        except Exception:
-            can_retry = False
+        # Arbiter timeout/transport failure supplies no mathematical evidence
+        # that justifies regenerating both solvers.
+        can_retry = False
         answer = "" if can_retry else _preferred_answer(
             state, state.get("validation_details") or {})
         return {
@@ -129,6 +138,13 @@ def _fallback_for_node(node: str, state: dict, error: dict, config: dict | None 
             "fallback_source": "validated_answer" if answer else (
                 "reasoning_raw" if state.get("reasoning_raw_response") else "generic_error"),
         }
+    if node == "database_retrieval":
+        return {**base, "retrieved_examples": [], "retrieval_candidates": [], "knowledge_cards": []}
+    if node == "submission":
+        return {**base, "final_response": state.get("final_response") or "解题过程中出现错误，无法给出完整答案。",
+                "submission_check": {"status": "check_failed", "complete": False}}
+    if node == "knowledge_review":
+        return {**base, "knowledge_review": {"status": "inconclusive", "reason": error["message"]}}
     return {**base, "should_terminate": True, "next_node": "coordinator"}
 
 
@@ -177,6 +193,17 @@ class ErrorHandler:
             if time_budget is not None:
                 time_budget.record(f"node:{name}", elapsed)
             if isinstance(result, dict):
+                # Keep earlier branch attempts when a targeted repair replaces
+                # its candidate; untouched branches retain their original trace.
+                if name in {"reasoning_agent", "python_agent"}:
+                    prefix = "reasoning" if name == "reasoning_agent" else "python"
+                    trace_key = f"{prefix}_trace"
+                    attempts_key = f"{prefix}_attempts"
+                    if trace_key in result:
+                        previous = list(guarded_state.get(trace_key) or [])
+                        result[trace_key] = previous + list(result[trace_key] or [])
+                    if attempts_key in result:
+                        result[attempts_key] += guarded_state.get(attempts_key, 0)
                 if integrity_events:
                     result.setdefault("problem_integrity_events", []).extend(integrity_events)
                 if guarded_state is not state:

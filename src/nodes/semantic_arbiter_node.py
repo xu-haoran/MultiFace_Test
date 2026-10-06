@@ -130,7 +130,6 @@ def _candidate_pool(state: dict) -> list[_Candidate]:
     reasoning_evidence = "\n".join(part for part in (
         _bounded(rr.get("analysis", ""), 5000),
         _bounded(reasoning_steps, 5000),
-        _bounded("\n".join(str(point) for point in (rr.get("validation_points", []) or [])), 2000),
     ) if part.strip())
     authenticity = po.get("authenticity") or {}
     fabrication_warning = ""
@@ -152,6 +151,13 @@ def _candidate_pool(state: dict) -> list[_Candidate]:
         candidates.append(_Candidate("reasoning", reasoning_answer, reasoning_evidence))
     if python_answer:
         candidates.append(_Candidate("python", python_answer, python_evidence))
+    from utils.flow_policy import knowledge_candidate_eligible
+    if knowledge_candidate_eligible(problem, question_mode) and po.get("semantic_candidate"):
+        semantic = _usable_answer(po["semantic_candidate"])
+        if semantic and objective_answer_is_consistent(semantic, problem, question_mode) \
+                and (question_mode != "fill" or fill_answer_matches_blanks(semantic, problem)):
+            candidates.append(_Candidate("python_semantic", semantic,
+                "[未验证的知识候选] 不构成数学证据，禁止因程序运行成功优先选择。\n" + python_evidence))
 
     unique = []
     seen = set()
@@ -255,8 +261,9 @@ def _fallback_result(state: dict, config: dict, status: str, trace: list[dict]) 
 
     worth_retry = (
         status in _SEMANTIC_STALEMATE
+        and (state.get("validation_details") or {}).get("routing_reason") != "complete_candidates_conflict"
         and reconciliation_retry_available(state, config)
-        and not (time_budget and time_budget.fast_path())
+        and not (time_budget and time_budget.closeout_started())
     )
     if worth_retry:
         return {
@@ -281,6 +288,12 @@ def _fallback_result(state: dict, config: dict, status: str, trace: list[dict]) 
 def semantic_arbiter_node(state, config):
     """Select one complete candidate verbatim, or abstain without damaging state."""
     trace = list(state.get("semantic_arbiter_trace") or [])
+    deps = get_deps(config)
+    time_budget = deps.time_budget
+    if time_budget and time_budget.closeout_started():
+        trace.append({"status": "skipped", "reason": "closeout_reserved"})
+        return _fallback_result(state, config, "closeout_reserved", trace)
+
     problem = state.get("problem", "") or ""
     if len(problem) > _MAX_PROBLEM_CHARS:
         trace.append({"status": "skipped", "reason": "problem_too_long_for_complete_review"})
@@ -291,7 +304,6 @@ def semantic_arbiter_node(state, config):
         trace.append({"status": "skipped", "reason": "fewer_than_two_usable_candidates"})
         return _fallback_result(state, config, "skipped", trace)
 
-    deps = get_deps(config)
     budget = deps.token_budget
     nonce = secrets.token_hex(8).upper()
     shuffled = list(candidates)
@@ -317,6 +329,15 @@ def semantic_arbiter_node(state, config):
         validation_reason=_bounded((state.get("validation_details") or {}).get("reason", ""), 1000),
         candidates="\n\n".join(blocks),
     )
+    if any(c.source == "python_semantic" for c in candidates):
+        from utils.skill_excerpt import select_skill_excerpt
+        from utils.shared_constraints import problem_constraints
+        try:
+            source = select_skill_excerpt(deps.skills_loader.get_skill_document(state["category"]), problem, 2200)
+        except Exception:
+            source = ""
+        prompt += problem_constraints(problem) + "\n知识来源（仅作参考）：\n" + source
+        prompt += "\n未验证知识候选只能依据来源和独立概念推导选取，来源不充分或口径歧义时弃权。"
     messages = [
         {"role": "system", "content": SEMANTIC_ARBITER_SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
@@ -324,22 +345,10 @@ def semantic_arbiter_node(state, config):
     max_tokens = CONFIG["max_tokens"]["semantic_arbiter"]
     prompt_tokens = estimate_tokens(SEMANTIC_ARBITER_SYSTEM_PROMPT + prompt)
     attempts = state.get("semantic_arbiter_attempts", 0) + 1
-    time_budget = deps.time_budget
 
     if budget and not budget.can_afford(prompt_tokens + max_tokens):
         trace.append({"attempt": attempts, "status": "budget_exhausted", "candidate_count": len(candidates)})
         result = _fallback_result(state, config, "budget_exhausted", trace)
-        result["semantic_arbiter_attempts"] = attempts
-        return result
-
-    # 评委建议 5：reserve 划出固定配额给仲裁，杜绝 `arbiter=skipped(0.0s)`。
-    # 旧门槛是软预算（expired()），于是 900s 耗尽的难题——恰恰最需要复核——
-    # 全部跳过仲裁。现在只要硬上限前还有配额，prefill 仲裁（~10s）照常执行；
-    # 真正的硬时限不足才跳过。
-    reserve_quota = CONFIG.get("arbiter_reserve_quota_s", 75)
-    if time_budget and time_budget.remaining_hard() < reserve_quota:
-        trace.append({"attempt": attempts, "status": "time_exhausted", "candidate_count": len(candidates)})
-        result = _fallback_result(state, config, "time_exhausted", trace)
         result["semantic_arbiter_attempts"] = attempts
         return result
 
@@ -352,11 +361,12 @@ def semantic_arbiter_node(state, config):
             prefix=SEMANTIC_ARBITER_PREFILL.format(nonce=nonce),
             temperature=CONFIG["temperatures"]["semantic_arbiter"],
             max_tokens=max_tokens,
+            top_p=CONFIG["top_p"]["semantic_arbiter"],
+            top_k=CONFIG["top_k"]["semantic_arbiter"],
             logger=deps.logger,
             time_budget=time_budget,
             expected_call_seconds=10,
             label="arbiter_prefill",
-            reserve_margin_s=45,
         )
     except Exception as exc:  # noqa: BLE001 - fall through to the plain call.
         deps.logger.warning("Prefilled arbiter call failed: %s", exc)
@@ -366,7 +376,7 @@ def semantic_arbiter_node(state, config):
         budget.consume(prompt_tokens, estimate_tokens(raw))
     selected_id = _parse_selection(raw, nonce, set(by_id))
 
-    if selected_id is None and not (time_budget and time_budget.fast_path()):
+    if selected_id is None and not (time_budget and time_budget.closeout_started()):
         prefill_used = False
         try:
             raw = chat_with_retry(
@@ -374,6 +384,8 @@ def semantic_arbiter_node(state, config):
                 messages=messages,
                 temperature=CONFIG["temperatures"]["semantic_arbiter"],
                 max_tokens=CONFIG["max_tokens"]["semantic_arbiter_fallback"],
+                top_p=CONFIG["top_p"]["semantic_arbiter"],
+                top_k=CONFIG["top_k"]["semantic_arbiter"],
                 logger=deps.logger,
                 time_budget=time_budget,
                 expected_call_seconds=90,

@@ -20,8 +20,14 @@ class MockClient:
     def __init__(self, responses=None):
         self.responses = list(responses) if responses else []
         self.calls = []
-    def chat(self, messages, temperature=0.2, max_tokens=4096):
-        self.calls.append({"messages": messages, "temperature": temperature, "max_tokens": max_tokens})
+    def chat(self, messages, temperature=0.2, max_tokens=4096, top_p=1.0, top_k=-1):
+        self.calls.append({
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "top_p": top_p,
+            "top_k": top_k,
+        })
         if self.responses:
             return self.responses.pop(0)
         return "mock response"

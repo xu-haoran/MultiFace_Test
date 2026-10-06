@@ -1,9 +1,8 @@
 """题库参考示例区块的唯一构造入口。
 
-推理节点与 Python 节点各自内联拼装过同一段文本，两份实现的截断长度不同、
-措辞也会各自漂移。检索关系和注入数量由检索节点统一决定：高相似度最多 1 条，
-没有高相似度时相关题型最多 3 条；本模块只负责把已筛选的记录按安全规则格式化，
-调用方只保留各自的截断额度。
+推理节点与 Python 节点共用同一格式化逻辑。检索关系和注入数量由检索节点统一决定：
+高相似度最多 1 条，没有高相似度时相关题型最多 3 条；本模块对选中的题面、解答和
+正文不做字符截断，并按安全规则格式化。知识仅从本地 skills 读取。
 
 2026-08-20：区块必须自带**反锚定**说明。检索是向量近邻，命中的常常是"看起来
 几乎一样、答案却不同"的近似题，而这正是评测中最贵的一类失分：
@@ -28,7 +27,6 @@ from typing import Any, Dict, List
 from utils.retrieval_relation import answer_reuse_safety
 
 _HEADER = "\n\n参考示例（统一数学题库召回，已做结构关系检查）：\n"
-_KNOWLEDGE_HEADER = "\n\n本科数学知识卡（项目内学科手册提炼）：\n"
 
 #: 反锚定说明。放在示例**之前**——写在后面时模型往往已经先读完解答并锚定了结论。
 _ANTI_ANCHOR_NOTE = """
@@ -95,7 +93,7 @@ def _numeric_diff_line(problem: str, example_problem: str) -> str:
             + "。参数不同则结论不同，必须在本题参数下重算。\n")
 
 
-def _method_only_solution(solution: str, limit: int) -> str:
+def _method_only_solution(solution: str) -> str:
     """Keep procedural guidance while masking answer-bearing literals.
 
     Related records are retrieved for ideas, not as answer keys.  In
@@ -116,24 +114,21 @@ def _method_only_solution(solution: str, limit: int) -> str:
             break
         kept.append(_NUMBER_LITERAL_RE.sub("<参数>", line))
     text = "\n".join(kept).strip()
-    return text[:limit] if text else "（仅提供题型方法；具体结论已隐藏。）"
+    return text if text else "（仅提供题型方法；具体结论已隐藏。）"
 
 
 def build_reference_block(
     examples: List[Dict[str, Any]] | None,
-    problem_chars: int,
-    solution_chars: int,
     problem: str = "",
 ) -> str:
     """把检索到的每一条相似题拼成参考区块；无检索结果时返回空串。
 
     Args:
         examples: 检索节点已按关系和注入上限筛选的 `retrieved_examples`，按相似度降序。
-        problem_chars: 每条题面的截断长度。
-        solution_chars: 每条解答的截断长度。
         problem: 本题题面。给出时逐条附上与示例的规模参数差异（反锚定）。
     """
-    usable = [ex for ex in (examples or []) if isinstance(ex, dict)]
+    usable = [ex for ex in (examples or []) if isinstance(ex, dict)
+              and ex.get("relation") in {"high_similarity", "related"}]
     if not usable:
         return ""
     parts = [_HEADER, _ANTI_ANCHOR_NOTE]
@@ -163,7 +158,6 @@ def build_reference_block(
                 f"{float(example.get('related_min_similarity', 0.70)):.2f} "
                 f"< 稠密相似度 ≤ {float(example.get('high_similarity_min', 0.85)):.2f}）"
             ),
-            "sparse_reference": "关键词召回（仅方法参考；不参与稠密相似度分档）",
         }.get(relation, "关系未确认")
         parts.append(
             f"\n### 示例 {i}（关系: {relation_label}；稠密相似度: {similarity:.3f}；"
@@ -197,46 +191,23 @@ def build_reference_block(
         diff = _numeric_diff_line(problem, example_problem) if problem and not answer_safe else ""
         if diff:
             parts.append(diff)
-        parts.append(f"**题目：**\n{example_problem[:problem_chars]}\n\n")
+        parts.append(f"**题目：**\n{example_problem}\n\n")
         reference_answer = str(example.get("reference_answer") or "").strip()
         solution = str(example.get("solution") or "").strip()
         if full_reference_visible and (solution_type == "short_reference" or (reference_answer and not solution)):
             parts.append(
                 "**高度一致候选的短答案（不是完整题解；请核验后再用于当前题）：**\n"
-                f"{(reference_answer or solution)[:solution_chars]}\n"
+                f"{reference_answer or solution}\n"
             )
         elif full_reference_visible:
-            parts.append(f"**高度一致候选的完整参考解：**\n{solution[:solution_chars]}\n")
+            parts.append(f"**高度一致候选的完整参考解：**\n{solution}\n")
         else:
             parts.append(
                 "**相似题参考解题过程（只借鉴方法，不迁移答案）：**\n"
-                f"{_method_only_solution(solution or reference_answer, solution_chars)}\n"
+                f"{_method_only_solution(solution or reference_answer)}\n"
             )
         if i < len(usable):
             parts.append("\n---\n")
     return "".join(parts)
 
 
-def build_knowledge_card_block(
-    cards: List[Dict[str, Any]] | None,
-    *,
-    content_chars: int = 700,
-) -> str:
-    """Format local method cards without presenting them as retrieved answers."""
-    usable = [card for card in (cards or []) if isinstance(card, dict)]
-    if not usable:
-        return ""
-    parts = [_KNOWLEDGE_HEADER]
-    parts.append(
-        "这些卡片来自项目已有的学科手册与验证说明，不是题库答案。"
-        "只用它们核对定理前提、方法和验证条件；所有结论仍须由本题推导或计算得到。\n"
-    )
-    labels = {"constraint": "条件卡", "method": "方法卡", "verification": "验证卡"}
-    for card in usable:
-        label = labels.get(str(card.get("card_type") or ""), "知识卡")
-        parts.append(
-            f"\n### {label}：{card.get('title', '')}\n"
-            f"来源：{card.get('source', '项目内学科资料')}\n"
-            f"{str(card.get('content') or '')[:content_chars]}\n"
-        )
-    return "".join(parts)

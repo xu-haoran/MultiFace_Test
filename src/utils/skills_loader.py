@@ -156,6 +156,7 @@ class SkillsLoader:
         self._retrieval_tokens, self._retrieval_weights = self._build_retrieval_index()
         self._doc_cache: Dict[str, str] = {}
         self._script_cache: Dict[str, str] = {}
+        self._file_versions = {}
         self._embedding_index = None
 
     def _scan_category_names(self) -> List[str]:
@@ -203,17 +204,23 @@ class SkillsLoader:
         }
         return tokens_by_cat, weights
 
+    def _read_local(self, category: str, suffix: str, cache: Dict[str, str]) -> str:
+        if category not in self.categories:
+            raise ValueError(f"Unknown local skill category: {category}")
+        path = self.base_path / category / (category + suffix)
+        info = path.stat()
+        version = (info.st_mtime_ns, info.st_size)
+        key = (category, suffix)
+        if self._file_versions.get(key) != version:
+            cache[category] = path.read_text(encoding="utf-8")
+            self._file_versions[key] = version
+        return cache[category]
+
     def get_skill_document(self, category: str) -> str:
-        if category not in self._doc_cache:
-            f = self.base_path / category / f"{category}skill.md"
-            self._doc_cache[category] = f.read_text(encoding="utf-8")
-        return self._doc_cache[category]
+        return self._read_local(category, "skill.md", self._doc_cache)
 
     def get_validation_script(self, category: str) -> str:
-        if category not in self._script_cache:
-            f = self.base_path / category / f"{category}验证示例.py"
-            self._script_cache[category] = f.read_text(encoding="utf-8")
-        return self._script_cache[category]
+        return self._read_local(category, "验证示例.py", self._script_cache)
 
     def find_candidate_categories(self, problem: str, top_k: int = 5) -> List[Tuple[str, float]]:
         scores = {}

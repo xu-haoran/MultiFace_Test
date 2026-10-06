@@ -36,6 +36,11 @@ def answer_part_count(answer):
 
 def _enumeration_satisfied(answer):
     text = answer or ""
+    # One object, an empty solution set, or a symbolic set can be exhaustive.
+    if re.search(r"无解|不存在|空集|\\emptyset|no solutions?|none|唯一|only|所有|全部|\\forall|∀|[{}]|∅", text, re.I):
+        return True
+    if re.fullmatch(r"[\s$]*[-+]?\d+(?:\.\d+)?[\s$。.]*", text):
+        return True
     if answer_part_count(text) >= 2:
         return True
     return len(re.findall(r"(?m)(?:^|[；;]\s*)\s*\d+\s*[.、)]", text)) >= 2
@@ -104,6 +109,13 @@ _SATISFIED = {
 def required_components(problem):
     """由题面文本推断答案必须包含的组成部分（component id 列表）。"""
     p = problem or ""
+    # Explicit requests outrank descriptive words in the premises. In
+    # particular, finding a count/value does not request an enumeration or the
+    # optimiser merely because 'all'/'maximum' occurs in the description.
+    scalar_request = bool(re.search(
+        r"(?:求|计算|确定|给出)[^。？?\n]{0,30}(?:个数|数量|数目|多少|最大值|最小值)|"
+        r"(?:how many|find|determine|calculate|compute)[^.?\n]{0,45}(?:number|count|maximum|minimum)|"
+        r"(?:how many|number of)[^.?\n]{0,60}[？?]", p, re.I))
     comps = []
     if "检验" in p and _has(p, r"H_?\{?0\}?|原假设|显著性水平|\\alpha|α"):
         comps.append("hypothesis_conclusion")
@@ -136,12 +148,20 @@ def required_components(problem):
 
     if asks_feasibility_then_count(p):
         comps.append("feasibility_count")
+    if scalar_request and not re.search(r"(?:列出|写出|枚举|list|enumerate)[^。\n]{0,30}(?:所有|全部|all)", p, re.I):
+        comps = [c for c in comps if c != "enumerate_all"]
     return comps
 
 
 def missing_components(problem, answer):
     """返回答案缺失的契约组成部分；空列表表示满足契约。"""
-    return [c for c in required_components(problem) if not _SATISFIED[c](answer or "")]
+    required = required_components(problem)
+    # A bare optimum is sufficient unless the problem also asks where it is
+    # attained. Do not force every extremum task to return an optimiser.
+    if "extremum_value" in required and re.fullmatch(r"[\s$]*[-+]?\d+(?:\.\d+)?[\s$。.]*", answer or "") \
+            and not re.search(r"并|分别|同时|以及|also|and\s+(?:find|determine)|取得.*时|达到.*时", problem or "", re.I):
+        required.remove("extremum_value")
+    return [c for c in required if not _SATISFIED[c](answer or "")]
 
 
 def recover_hypothesis_conclusion(fulltext):

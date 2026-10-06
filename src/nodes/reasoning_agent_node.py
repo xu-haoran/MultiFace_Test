@@ -10,8 +10,10 @@ from utils.answer_extractor import (
 )
 from utils.conclusion_salvage import salvage_conclusion
 from utils.cot_stripper import is_placeholder_answer, strip_cot_prefix
-from utils.reference_block import build_knowledge_card_block, build_reference_block
-from utils.skill_excerpt import select_skill_excerpt
+from utils.reference_block import build_reference_block
+from utils.skill_excerpt import select_skill_excerpt, selected_card_ids
+from utils.shared_constraints import problem_constraints
+from utils.llm_retry import completion_metadata
 from utils.retry_affordability import can_afford_retry, last_attempt_cost
 from utils.problem_profile import (
     answer_coverage_clause,
@@ -25,28 +27,23 @@ from utils.problem_profile import (
     recover_complete_fill_answer,
     structure_instruction,
 )
+from utils.time_budget import CLOSEOUT_EMERGENCY_BUFFER_S
 from config import CONFIG
 
 
 def _reference_examples_block(examples, problem: str = "") -> str:
-    """推理提示词里的题库参考区块（题面 800 / 解答 1200 字符）。
+    """推理提示词里的题库参考区块，完整保留入选记录正文。
 
     传入本题题面，让区块能逐条摆出与示例的规模参数差异——检索到的近似题被当成
     本题照抄结论，是评测中最贵的一类失分（idx 48、17）。
     """
-    return build_reference_block(examples, problem_chars=800, solution_chars=1200,
-                                 problem=problem)
-
-
-def _knowledge_cards_block(cards) -> str:
-    """Compact local method/constraint cards, separate from answer examples."""
-    return build_knowledge_card_block(cards, content_chars=650)
+    return build_reference_block(examples, problem=problem)
 
 
 def _parse_reasoning_output(response, question_mode="computation", problem=""):
     raw = response
     response = strip_cot_prefix(response)
-    r = {"analysis": "", "steps": [], "answer": "", "validation_points": []}
+    r = {"analysis": "", "steps": [], "answer": "", "completion_metadata": completion_metadata(raw)}
     m = re.search(r"## 问题分析\s+(.*?)(?=##|$)", response, re.DOTALL)
     if m:
         r["analysis"] = m.group(1).strip()
@@ -58,16 +55,13 @@ def _parse_reasoning_output(response, question_mode="computation", problem=""):
     am = re.search(r"## 最终答案\s+(.*?)(?=##|$)", response, re.DOTALL)
     if am:
         r["answer"] = _distill_answer(am.group(1).strip())
-    vm = re.search(r"## 关键验证点\s+(.*?)(?=##|$)", response, re.DOTALL)
-    if vm:
-        r["validation_points"] = re.findall(r"-\s*(.+)", vm.group(1))
     if not r["answer"]:
         # conclusion.  boxed/labelled 是模型显式提交的结论（fallback_marker）；
         # 行级扫描（payload_line）置信度与 salvage 同级，标为 fallback_line，
         # 耗尽判定会把它视为"没有产出"（2026-08-10 评委报告 4.2）。
         fallback, tier = extract_answer_fallback_with_source(
             raw if isinstance(raw, str) else response)
-        if fallback:
+        if fallback and tier != "payload_line":
             distilled = _distill_answer(fallback)
             cleaned = _reject_bad_answer(distilled)
             if cleaned:
@@ -78,6 +72,8 @@ def _parse_reasoning_output(response, question_mode="computation", problem=""):
         # Ordinary chat responses occasionally omit the ``答案：`` label and put
         for line in reversed(str(response or "").splitlines()):
             candidate = line.strip().strip("`*_ ")
+            if question_mode == "fill" and len(str(response or "").strip().splitlines()) != 1:
+                continue
             if question_mode == "choice" and not re.fullmatch(
                     r"[A-EＡ-Ｅ](?:\s*[、,，/和及&]\s*[A-EＡ-Ｅ])*[。.]?", candidate,
                     flags=re.I):
@@ -87,11 +83,6 @@ def _parse_reasoning_output(response, question_mode="computation", problem=""):
                 r["answer"] = normalized
                 r["answer_source"] = "bare_objective_line"
                 break
-    if not r["answer"]:
-        salvaged = salvage_conclusion(raw if isinstance(raw, str) else response)
-        if salvaged:
-            r["answer"] = salvaged
-            r["answer_source"] = "salvaged_prose"
     if question_mode == "fill" and problem:
         recovered = recover_complete_fill_answer(raw, problem)
         if recovered and fill_answer_matches_blanks(recovered, problem):
@@ -108,7 +99,7 @@ def _parse_reasoning_output(response, question_mode="computation", problem=""):
             r["answer"] = ""
     # The concise objective prompt uses ``依据：`` instead of the four-section
     if r["answer"] and not r["steps"] and is_objective_mode(question_mode):
-        evidence = re.search(r"(?:依据|理由|说明)\s*[：:]\s*(.+)", response or "", re.S)
+        evidence = re.search(r"(?:核对|依据|理由|说明)\s*[：:]\s*(.+?)(?=\n\s*答案\s*[：:]|$)", response or "", re.S)
         description = evidence.group(1).strip() if evidence else "按选项/空位逐项核对题面条件。"
         r["steps"] = [{"step_num": 1, "description": description[:600]}]
     return r
@@ -204,139 +195,48 @@ def _rhs_of_top_level_eq(line):
 
 
 def _distill_answer(text):
-    """Distill a concise answer from the '## 最终答案' section text.
+    """Preserve the explicit answer section, including definitions and all parts.
 
-    策略顺序（每个候选都要通过 placeholder/残片检查，失败则落到下一策略）：
-    1. 枚举节（≥2 个编号/列表项）→ 全部条目整体保留（评委报告：抽象代数__013
-       曾只剩 1 个群）。
-    2. 多行短节 → 保留所有信息行（含无 '=' 的结论行——统计推断__009~012 的
-       "拒绝/不拒绝 H0" 结论行曾被只留等式行的旧逻辑丢弃）。
-    3. 短节（≤80 字符）→ 最后一行。
-    4. 显式 '答案是X' 模式。
-    5. 行尾顶层 '=' 右值（LaTeX 感知，绝不切进公式内部）；右值残缺时保留整行。
-    6. 首个信息行。
+    Extraction must not replace an equation by its last right-hand side or drop
+    unboxed conditions/definitions surrounding a boxed result.
     """
-    text = (text or "").strip()
-    if is_placeholder_answer(text):
-        return ""
-    lines = [l.strip() for l in text.splitlines() if l.strip()]
-
-    # 1. 枚举节：所有条目整体保留（保留带信息的引导行，如"共 4 种："）
-    enum_items = [l for l in lines if _ENUM_ITEM_RE.match(l)]
-    if len(enum_items) >= 2 and len(text) <= 1600:
-        kept = [_strip_bullet(l) for l in lines
-                if _ENUM_ITEM_RE.match(l) or _PAYLOAD_LINE_RE.search(l)]
-        joined = _join_parts(kept)
-        if not looks_like_latex_fragment(joined) and not is_placeholder_answer(joined):
-            return joined
-
-    # 2. 多行短节：保留所有信息行（等式行 + 结论行），过滤纯引导语
-    eq_lines = [_strip_bullet(l) for l in lines if "=" in l]
-    if 2 <= len(lines) <= 8 and len(text) <= 900 and eq_lines \
-            and all(len(l) <= 200 for l in lines):
-        kept = [_strip_bullet(l) for l in lines if _PAYLOAD_LINE_RE.search(l)]
-        joined = _join_parts(kept)
-        if kept and not looks_like_latex_fragment(joined) and not is_placeholder_answer(joined):
-            return joined
-    if len(eq_lines) >= 3:
-        conclusion_extra = [_strip_bullet(l) for l in lines
-                            if "=" not in l and re.search(r"拒绝|接受|显著|结论|建议|选择|综上", l)]
-        joined = _join_parts(eq_lines + conclusion_extra)
-        if len(joined) <= 1600 and not looks_like_latex_fragment(joined) and not is_placeholder_answer(joined):
-            return joined
-
-    # 2.5. \boxed 结论：\boxed{...} 是模型显式提交的最终结论，优先于引导语与括注。
-    # 数学分析__079：整节「所有…为 / $$\boxed{ab\ge e^3}$$ /（即…）」按旧逻辑
-    # 落到策略 3 取最后一行括注，把公式丢了。多个 boxed 用「；」连接保留全部结论。
-    boxes = re.findall(r"\\boxed\s*\{((?:[^{}]|\{[^{}]*\})*)\}", text)
-    if boxes:
-        answer = _reject_bad_answer(_join_parts(boxes))
-        if answer:
-            return answer
-
-    # 3. 短节 → 最后一行
-    if len(text) <= 80:
-        return _reject_bad_answer(lines[-1] if lines else text)
-
-    # 4. 显式"答案是X"
-    for pat in (r"答案[是为：:]\s*(.+?)(?:\n|$)", r"answer\s*[:is]+\s*(.+?)(?:\n|$)"):
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            answer = _reject_bad_answer(m.group(1))
-            if answer:
-                return answer
-
-    # 5. 行尾顶层 '=' 右值；右值残缺时退回整行（不得切进 LaTeX 公式内部）
-    eq_line = next((l for l in reversed(lines) if "=" in l), "")
-    if eq_line:
-        answer = _reject_bad_answer(_rhs_of_top_level_eq(eq_line))
-        if answer:
-            return answer
-        answer = _reject_bad_answer(_strip_bullet(eq_line))
-        if answer:
-            return answer
-
-    # 6. 首个信息行，最后兜底整节
-    for cand in ([l for l in lines if _PAYLOAD_LINE_RE.search(l)][:1]
-                 + ([lines[0]] if lines else [])
-                 + ([text] if len(text) <= 600 else [])):
-        answer = _reject_bad_answer(cand)
-        if answer:
-            return answer
-    return ""
+    from utils.answer_formatter import _strip_answer_label
+    return _reject_bad_answer(_strip_answer_label(str(text or "").strip()))
 
 
 def _is_complete(r):
     return bool(r["answer"]) and len(r["steps"]) >= 1
 
 
-_EXHAUSTION_MIN_CHARS = 2000
+def _token_exhaustion_reason(response: str, parsed: dict,
+                            max_tokens: int | None = None) -> str:
+    """Confirm token-limit truncation only from provider metadata.
 
-
-#: 捞回来源的答案不构成"真实产出"：它们是从截断散文里扫出的残句，置信度
-#: 不足以取消压缩重试（2026-08-10 评委报告 4.2 实证：捞回先于耗尽判定，
-#: 使压缩重试在 30 题里 0 次触发，6 题以中间句出厂）。
-_SCAVENGED_SOURCES = ("salvaged_prose", "fallback_line")
-
-
-def _token_exhaustion_reason(response: str, parsed: dict) -> str:
-    """Return a stable reason when a long answer is visibly incomplete.
-
-    Submission_5 only recognised the most extreme case: a long response with no
-    parseable section.  The same parser can distinguish a second observable case:
-    analysis or early steps exist, but no usable final section was completed.
-    Repeating the full prompt tends to follow the same long trajectory.  A long,
-    incomplete response therefore uses the existing bounded prefilled recovery,
-    while short format slips keep the ordinary retry.
-
-    Scavenged answers are deliberately not treated as a finished conclusion: they
-    may be intermediate expressions found in the cut-off prose.
+    Response length and missing Markdown sections are not proof that the model hit
+    its output cap. A complete parsed answer always wins, even if the provider says
+    the cap was reached; compression is only for a confirmed cap plus incomplete
+    output.
     """
-    text = response or ""
-    if len(text) < _EXHAUSTION_MIN_CHARS:
+    if _is_complete(parsed):
         return ""
 
-    answer = parsed.get("answer")
-    reliable_answer = bool(answer) and parsed.get("answer_source") not in _SCAVENGED_SOURCES
-    if reliable_answer and parsed.get("steps"):
-        return ""
-    has_final_section = "## 最终答案" in text
+    finish_reason = str(getattr(response, "finish_reason", "") or "").lower()
+    if finish_reason in {"length", "max_tokens", "token_limit", "max_output_tokens"}:
+        return "token_limit_reached_incomplete_output"
 
-    if not parsed.get("analysis") and not parsed.get("steps") \
-            and not reliable_answer and not has_final_section:
-        return "token_budget_exhausted_before_sections"
-    if not has_final_section:
-        return "token_budget_exhausted_before_final_answer"
-    if not reliable_answer:
-        return "token_budget_exhausted_in_final_answer"
-    if not parsed.get("steps"):
-        return "token_budget_exhausted_before_complete_steps"
-    return "token_budget_exhausted_partial_output"
+    completion_tokens = getattr(response, "completion_tokens", None)
+    try:
+        reached_limit = max_tokens is not None and completion_tokens is not None \
+            and int(completion_tokens) >= int(max_tokens)
+    except (TypeError, ValueError):
+        reached_limit = False
+    return "token_limit_reached_incomplete_output" if reached_limit else ""
 
 
-def _looks_token_exhausted(response: str, parsed: dict) -> bool:
+def _looks_token_exhausted(response: str, parsed: dict,
+                           max_tokens: int | None = None) -> bool:
     """Compatibility boolean for callers and tests."""
-    return bool(_token_exhaustion_reason(response, parsed))
+    return bool(_token_exhaustion_reason(response, parsed, max_tokens=max_tokens))
 
 
 def _reasoning_state(parsed: dict, trace: list, attempts: int, response: str,
@@ -350,6 +250,7 @@ def _reasoning_state(parsed: dict, trace: list, attempts: int, response: str,
     this constructor in one place makes the state/trace contract auditable.
     """
     return {
+        "reasoning_skill_cards": next((item.get("cards", []) for item in reversed(trace) if item.get("status") == "local_skill_selection"), []),
         "reasoning_result": parsed,
         "reasoning_trace": trace,
         "reasoning_attempts": attempts,
@@ -362,35 +263,34 @@ def _reasoning_state(parsed: dict, trace: list, attempts: int, response: str,
 #: 压缩重试的估时：8192 token 上限 @ ~50 tok/s，再留传输余量。
 _COMPRESSED_CALL_ESTIMATE_S = 200
 
-#: 压缩重试允许动用 reserve，但必须给收尾链留出这些硬时限余量（仲裁 prefill
-#: 配额 75s + 应急直答 + 确定性拼装）。评委报告 5.3（2026-08-10）：首轮推理
-#: 700-980s 后软预算已尽，按软预算定价的压缩重试在 30 题中 0 次放行，6 题以
-#: 捞回残片出厂——"保输出"保的必须是正确的输出。reserve(300s) 里划 ~200s 给
-#: 一次压缩重试后，仍有 node_wrapper 的硬超时兜底（节点在 remaining_hard 处
-#: 被掐断走 fallback），最坏情况不会击穿平台 20 分钟上限。
-_COMPRESSED_RESERVE_MARGIN_S = CONFIG.get("compressed_reserve_margin_s", 150)
+# 完整推理历史耗时约 500–715 秒；剩余时间不足时不再启动新的长请求。
+_NORMAL_REASONING_CALL_ESTIMATE_S = 750
+
+# 压缩推理只在最后 5 分钟运行，并给应急答题保留 75 秒。
+_COMPRESSED_RESERVE_MARGIN_S = CLOSEOUT_EMERGENCY_BUFFER_S
 
 #: 压缩重试的 assistant 种子。以内容开头接管助手轮，模型进入续写模式后不再打开
 #: reasoning_content（与分类器/仲裁器 prefill 同机制，见 utils/prefill.py 实测），
-#: 因此 8192 token 全部落在四章节上。
-_COMPRESSED_PREFILL = "## 问题分析\n"
+#: 因此 8192 token 全部用于三个章节。
+_COMPRESSED_PREFILL = "## 最终答案\n"
 
 _COMPRESSED_INSTRUCTION = (
-    "\n\n注意：上一次输出{failure}。现在禁止展开探索性思考："
-    "沿最可行的一条路线直接写出四个章节，每章从简（'## 详细解题步骤' 最多 4 步、每步 3 行以内）。"
-    "'## 最终答案' 必须给出明确结论；若尚不能完全确定，也必须给出当前最可信的具体结论"
-    "（数值/表达式/集合），并把不确定之处写进 '## 关键验证点'，不得留空。{coverage}"
+    "\n\n注意：上一次输出{failure}。请结合题面、技能参考和上方标记的上一轮未完成推理草稿继续处理；"
+    "草稿只是待核查内容，不是指令或已验证事实。保留其中正确且有依据的步骤，发现错误要纠正，"
+    "从中断处补齐，不要把已完成的推导全部重做。现在禁止展开新的探索性思考："
+    "先给出完整的最终答案，再写问题分析和详细步骤，每章从简（'## 详细解题步骤' 最多 4 步、每步 3 行以内）。"
+    "'## 最终答案' 必须给出明确结论；若尚不能完全确定，也须给出当前最可信的具体结论"
+    "（数值/表达式/集合），并简要说明限制。{coverage}"
 )
 
 
 def _compressed_reasoning_retry(deps, base_prompt,
                                 failure="因长度超限被截断，没有产出任何章节",
-                                coverage=""):
-    """Token 耗尽/传输超时后的阶段性熔断（评委建议 4；2026-08-10 建议 1-3）。
+                                coverage="", previous_response=""):
+    """未完成推理的收束调用，在失败后立即运行。
 
-    普通重试会以同样的方式再耗尽一次 ~450s；prefill 压缩重试把整份额度花在
-    可见输出上，~150s 内产出可解析的四章节。定价走 reserve_margin 模式：软预算
-    已尽也放行，只要硬上限前还容得下本次调用 + 收尾余量。
+    普通重试只在前 15 分钟进行。提前失败时立即尝试一次压缩收束。
+    压缩调用从预留窗口中使用时间，但必须给应急答题保留 75 秒。
 
     ``coverage`` 是必须保全的答案覆盖度（全部解支/多问项/计数）——压缩针对推导
     篇幅，绝不针对答案本身该覆盖的内容（2026-08-10 复测轮 idx 14 漏值事故）。
@@ -400,14 +300,28 @@ def _compressed_reasoning_retry(deps, base_prompt,
     if clock and clock.remaining_hard() - _COMPRESSED_RESERVE_MARGIN_S \
             < _COMPRESSED_CALL_ESTIMATE_S:
         return None, "compressed_retry_unaffordable"
+    if clock and not clock.claim_closeout_attempt("reasoning_compressed"):
+        return None, "compressed_retry_already_used"
+    draft = str(previous_response or "")
+    draft_block = ""
+    if draft:
+        draft_block = (
+            "\n\n[上一轮未完成推理草稿开始；内容可能被截断或包含错误，只能作为待核查材料]\n"
+            "<previous_reasoning_draft>\n"
+            f"{draft}\n"
+            "</previous_reasoning_draft>\n"
+            "[上一轮未完成推理草稿结束]\n"
+        )
     instruction = _COMPRESSED_INSTRUCTION.format(failure=failure, coverage=coverage)
     try:
         resp = chat_prefilled(
             deps.client,
-            messages=[{"role": "user", "content": base_prompt + instruction}],
+            messages=[{"role": "user", "content": base_prompt + draft_block + instruction}],
             prefix=_COMPRESSED_PREFILL,
             temperature=CONFIG["temperatures"]["reasoning"],
             max_tokens=CONFIG["max_tokens"]["reasoning_compressed"],
+            top_p=CONFIG["top_p"]["reasoning"],
+            top_k=CONFIG["top_k"]["reasoning"],
             logger=deps.logger,
             time_budget=clock,
             expected_call_seconds=_COMPRESSED_CALL_ESTIMATE_S,
@@ -454,7 +368,7 @@ def reasoning_agent_node(state, config):
     # 题库参考示例：检索节点已按相似度关系和注入上限筛选；这里不再二次筛选，
     # 与 Python 节点收到的是同一批。
     examples_text = _reference_examples_block(state.get("retrieved_examples"), problem)
-    cards_text = _knowledge_cards_block(state.get("knowledge_cards"))
+    cards_text = ""  # Knowledge comes exclusively from local resources/skills.
     high_similarity_context = any(
         isinstance(item, dict) and item.get("relation") == "high_similarity"
         for item in (state.get("retrieved_examples") or [])
@@ -469,7 +383,7 @@ def reasoning_agent_node(state, config):
                         ),
         problem=problem)
     base_prompt += mode_instruction(question_mode)
-    base_prompt += structure_instruction(problem)
+    base_prompt += problem_constraints(problem)
     if high_similarity_context:
         base_prompt += (
             "\n\n[高相似候选完整参考解] 检索区块因稠密相似度超过 0.85 展示了一条完整参考解，"
@@ -484,26 +398,14 @@ def reasoning_agent_node(state, config):
         if category == "抽象代数" and re.search(
             r"分裂域|Galois|伽罗瓦|域扩张|扩张次数|单位根", problem, flags=re.I
         ):
-            # 2026-08-10 复测轮 idx 86：本守卫已存在，模型仍答 Q(∜5, i) 与次数 8。
-            # 补上可机械执行的判据（ζ_n 的实部/虚部展开、√2 的归属、塔次数乘积
-            # 与根个数的对账），把"要检查"变成"照着算"。
             domain_guard = (
-                "[分裂域机械核验] 若涉及域扩张或分裂域，按以下顺序机械执行，不得跳步："
-                "(1) 将所写的每个候选根代回原多项式，列出全部根及其所需单位根；"
-                "(2) 若根式表达式需要 ζ_8，则生成元必须保留 ζ_8（或明确等价地保留 √2），"
-                "不能只写 i；ζ_8=(√2/2)(1+i)，Q(i) 本身不含 √2；"
-                "(3) 用塔定理把次数写成各层次数之积，并逐层说明新增生成元不在已有域中；"
-                "(4) 特征零上的可分多项式，其分裂域必为 Galois 扩张。"
+                "[域扩张核验] 定义每个新增生成元，列出全部候选根并代回原多项式；"
+                "不要混用正实根与所选复根的记号。对 x^n−a 型，可先选 α 满足 α^n=a，"
+                "再以 αζ_n^k 列出根，ζ_n 为原始 n 次单位根；核对所写域是否包含全部根。"
+                "用最小多项式与塔定理说明扩张次数，各层须考虑已有生成元之间的关系，"
+                "不能无依据把次数机械相乘。Galois 判断核对正规性与可分性。"
+                "最终答案里写出生成元的定义、次数和所有要求的判断。"
             )
-            if re.search(r"x\s*(?:\^\s*\{?\s*4\s*\}?|⁴)\s*\+\s*(?:\d+|[a-zA-Z])",
-                         problem):
-                domain_guard += (
-                    "\n[四次负常数项核验] 对 x⁴+c=0（c>0），若题目已定义 α⁴=−c，"
-                    "则 α 本身就是一个根，全部根为 α、−α、iα、−iα，分裂域写成"
-                    " Q(α,i)，不要把 α 偷换成正实根 ⁴√c 或额外写成 Q(⁴√c,ζ₈)。"
-                    "先用艾森斯坦/最小多项式核对 [Q(α):Q]=4，再核对 i 是否在该域中；"
-                    "若不在，塔次数乘以 2。答案必须同时给出生成域、次数和题目要求的判断。"
-                )
         # 空位数由代码侧数好写进提示（评委报告 idx 105：提示里的"先数空位"元指令
         # 被模型原样回显成了答案 "Count blanks: 1"；idx 86：三空只答零空未被拦截）。
         from utils.problem_profile import count_blanks, fill_answer_matches_blanks
@@ -542,14 +444,20 @@ def reasoning_agent_node(state, config):
             )
         else:
             contract = (
-                "不要展开长篇推导，不要输出 Thinking Process。"
-                "必须只输出两行：\n"
-                f"答案：<{answer_shape}>\n"
-                "依据：<不超过三句的定理/计算核对>"
+                "不要展开长篇推导，不要输出 Thinking Process。先核对，再提交：\n"
+                "核对：<按选项或空位检查定义、定理前提及边界，不超过五句；"
+                "明确哪些前提来自题面、哪些来自记号的通常定义，避免漏掉有界性等必要条件>\n"
+                f"答案：<{answer_shape}>"
             )
+        contract += (
+            "\n若题目问某个记号的定义或通常参数，先采用该课程的标准记号约定；"
+            "不能因另一种参数化或另一种记号也合法，就把它作为同一记号下的额外选项。"
+            "题面明确要求多选或问哪些陈述成立时逐项选择；单一术语/定义题按最直接的标准定义作答。"
+            "若确实无法唯一确定口径，在核对中说明，不凭空声称教材或官方规定。"
+        )
         objective_prompt = (
             "你是数学、统计学与计量经济学教师。严格按题库教材定义逐项核对题面选项/空位，"
-            "特别检查相近概念的边界（非参数回归不等于非线性回归，标准差与方差按技能口径区分）；"
+            "特别检查相近概念的边界（非参数回归不等于非线性回归，标准差与方差按题面参数化区分，来源未限定时保留歧义）；"
             f"{domain_guard}"
             "\n先阅读下面的普通检索参考；它们是工作解/方法提示，不是答案锁定。若检索相似度很高，"
             "复核其推导后尽量保持同一答案术语和语言；若相似度较低，只借方法并按本题重算。\n"
@@ -563,23 +471,23 @@ def reasoning_agent_node(state, config):
             "仍须在本题选项/条件上独立核对，再输出本题答案，不要迁移近似题结论。\n\n"
             f"题目：\n{problem}"
         )
-        objective_recovery_base = base_prompt + (
-            f"\n\n{domain_guard}" if domain_guard else ""
-        )
-        trace = []
+        objective_prompt += problem_constraints(problem)
+        if state.get("branch_hint"):
+            objective_prompt += "\n\n[独立复核提示] " + str(state["branch_hint"])
+        trace = [{"status": "local_skill_selection", "source": "resources/skills",
+              "cards": selected_card_ids(select_skill_excerpt(skill_doc, problem, 2200)),
+              "objective_cards": selected_card_ids(select_skill_excerpt(skill_doc, problem, 2200)),
+              "alternate_cards": [selected_card_ids(part) for part in alternate_skill_parts]}]
         response = ""
         attempts = 0
-        semantic_failure = ""
 
         def _semantic_check(candidate: dict) -> bool:
-            nonlocal semantic_failure
             if not candidate.get("answer"):
                 return False
             okay, reason = objective_answer_consistency(
                 candidate.get("answer", ""), problem, question_mode)
             if okay:
                 return True
-            semantic_failure = reason
             candidate["invalid_answer"] = candidate.get("answer", "")
             candidate["semantic_invalid_reason"] = reason
             candidate["answer"] = ""
@@ -593,6 +501,8 @@ def reasoning_agent_node(state, config):
                 temperature=CONFIG["temperatures"].get(
                     "objective_reasoning", CONFIG["temperatures"]["reasoning"]),
                 max_tokens=CONFIG["max_tokens"]["objective_reasoning"],
+                top_p=CONFIG["top_p"]["objective_reasoning"],
+                top_k=CONFIG["top_k"]["objective_reasoning"],
                 logger=deps.logger,
                 time_budget=deps.time_budget,
                 expected_call_seconds=45,
@@ -632,16 +542,18 @@ def reasoning_agent_node(state, config):
         incomplete_first = parsed if (
             parsed.get("answer") or parsed.get("incomplete_answer")
         ) else None
-        if not (deps.time_budget and deps.time_budget.fast_path()):
+        if not (deps.time_budget and deps.time_budget.closeout_started()):
             try:
                 attempts += 1
                 response = chat_prefilled(
                     client,
                     messages=[{"role": "user", "content": objective_prompt}],
-                    prefix="答案：",
+                    prefix="核对：",
                     temperature=CONFIG["temperatures"].get(
                         "objective_reasoning", CONFIG["temperatures"]["reasoning"]),
                     max_tokens=CONFIG["max_tokens"]["objective_reasoning"],
+                    top_p=CONFIG["top_p"]["objective_reasoning"],
+                    top_k=CONFIG["top_k"]["objective_reasoning"],
                     logger=deps.logger,
                     time_budget=deps.time_budget,
                     expected_call_seconds=60,
@@ -667,41 +579,13 @@ def reasoning_agent_node(state, config):
                 trace.append({"attempt": attempts, "status": "semantic_mismatch",
                               "reason": retry_parsed["semantic_invalid_reason"],
                               "response_chars": len(response or "")})
-        if not parsed.get("answer") and not (deps.time_budget and deps.time_budget.fast_path()):
-            # 两次短响应都解析失败（2026-08-10 评委报告模式 C：87/94/103 多选
-            # 3 连败，response 仅 75-212 字符）：升级为一次四章节压缩推理。
-            # prefill 抑制私有 CoT，"## 最终答案" 章节给归一化器一个真正的
-            # 答案行；客观题路径此时耗时尚少，压缩额度负担得起。
-            attempts += 1
-            failure = "过短且未能解析出答案行"
-            if semantic_failure:
-                failure += f"；上一候选未通过语义核验：{semantic_failure}"
-            esc_resp, esc_fail = _compressed_reasoning_retry(
-                deps,
-                objective_recovery_base,
-                failure=failure,
-                coverage=coverage_clause,
-            )
-            if esc_resp is None:
-                trace.append({"attempt": attempts, "status": "skipped",
-                              "reason": esc_fail or "objective_escalation_failed"})
-            else:
-                esc_parsed = _parse_reasoning_output(
-                    esc_resp, question_mode=question_mode, problem=problem)
-                esc_semantic_ok = _semantic_check(esc_parsed)
-                esc_fill_complete = question_mode != "fill" or fill_answer_matches_blanks(
-                    esc_parsed.get("answer", ""), problem)
-                entry = {"attempt": attempts,
-                         "status": "success" if esc_parsed.get("answer") else "failed",
-                         "reason": "objective_full_cot_escalation",
-                         "response_chars": len(esc_resp or "")}
-                if esc_parsed.get("answer") and esc_semantic_ok \
-                        and (esc_fill_complete or incomplete_first is None):
-                    parsed = esc_parsed
-                    response = esc_resp
-                elif not esc_parsed.get("answer"):
-                    entry["raw_excerpt"] = _raw_excerpt(esc_resp, head=300, tail=500)
-                trace.append(entry)
+        parsed_fill_complete = question_mode != "fill" or fill_answer_matches_blanks(
+            parsed.get("answer", ""), problem)
+        if (not parsed.get("answer") or not parsed_fill_complete
+                or parsed.get("semantic_invalid_reason")):
+            # 客观题格式/语义失败不代表长推理触及 token 上限，不走压缩推理。
+            trace.append({"status": "compressed_skipped",
+                          "reason": "not_a_confirmed_reasoning_token_limit"})
         final_entry = {"attempt": attempts,
                        "status": "success" if parsed.get("answer") else "failed",
                        "objective": True, "response_chars": len(response or "")}
@@ -716,12 +600,15 @@ def reasoning_agent_node(state, config):
     # 复核重试也保留 skill 文档与字段契约（旧实现只发 hint+题面，丢失了学科口径）
     prompt = f"{base_prompt}\n\n[复核提示] {hint}" if hint else base_prompt
     hinted_base = prompt
-    trace = []
+    trace = [{"status": "local_skill_selection", "source": "resources/skills",
+              "cards": selected_card_ids(select_skill_excerpt(skill_doc, problem, 3000)),
+              "objective_cards": selected_card_ids(select_skill_excerpt(skill_doc, problem, 2200)),
+              "alternate_cards": [selected_card_ids(part) for part in alternate_skill_parts]}]
     attempts = 0
     resp = ""
-    parsed = {"analysis": "", "steps": [], "answer": "", "validation_points": []}
+    parsed = {"analysis": "", "steps": [], "answer": ""}
     clock = deps.time_budget
-    if clock and clock.fast_path():
+    if clock and clock.closeout_started():
         max_attempts = 1
     for _ in range(max_attempts):
         if attempts and not can_afford_retry(clock, "reasoning"):
@@ -738,65 +625,58 @@ def reasoning_agent_node(state, config):
                 messages=[{"role": "user", "content": prompt}],
                 temperature=CONFIG["temperatures"]["reasoning"],
                 max_tokens=CONFIG["max_tokens"]["reasoning"],
+                top_p=CONFIG["top_p"]["reasoning"],
+                top_k=CONFIG["top_k"]["reasoning"],
                 logger=deps.logger,
                 time_budget=deps.time_budget,
+                expected_call_seconds=_NORMAL_REASONING_CALL_ESTIMATE_S,
                 label="reasoning",
             )
         except Exception as exc:  # noqa: BLE001 - keep whatever we already parsed.
             deps.logger.warning("Reasoning attempt %s failed: %s", attempts, exc)
             trace.append({"attempt": attempts, "status": "failed", "error": str(exc)[:200]})
-            # 传输失败（8 路并发下 780s 读超时为主）不再直接弃分支（2026-08-10
-            # 评委报告模式 B，9/30 题）：压缩 prefill 重试输出短、在拥堵下更可能
-            # 按时返回，且按 reserve_margin 定价——放弃只该发生在时间真不够时。
-            attempts += 1
-            rescued, fail_reason = _compressed_reasoning_retry(
-                deps, hinted_base, failure="因网络传输故障未能返回",
-                coverage=coverage_clause)
-            if rescued is None:
-                trace.append({"attempt": attempts, "status": "skipped",
-                              "reason": fail_reason or "compressed_rescue_failed"})
-                break
-            resp = rescued
-            rescued_parsed = _parse_reasoning_output(
-                resp, question_mode=question_mode, problem=problem)
-            if rescued_parsed.get("answer") or rescued_parsed.get("steps") \
-                    or rescued_parsed.get("analysis"):
-                parsed = rescued_parsed
-                parsed["answer_source"] = parsed.get("answer_source") or "compressed_prefill"
-            entry = {"attempt": attempts,
-                     "status": "success" if _is_complete(rescued_parsed) else "failed",
-                     "reason": "compressed_prefill_after_transport_failure",
-                     "response_chars": len(resp or "")}
-            if not _is_complete(rescued_parsed):
-                entry["raw_excerpt"] = _raw_excerpt(resp)
-            trace.append(entry)
             break
         if budget:
             budget.consume(estimate_tokens(prompt), estimate_tokens(resp))
         parsed = _parse_reasoning_output(
             resp, question_mode=question_mode, problem=problem)
-        exhaustion_reason = _token_exhaustion_reason(resp, parsed)
-        exhausted = bool(exhaustion_reason)
-        trace.append({"attempt": attempts,
-                      "status": "success" if _is_complete(parsed) and not exhausted else "failed",
-                      "response_chars": len(resp or ""),
-                      **({"reason": exhaustion_reason,
-                          "raw_excerpt": _raw_excerpt(resp)} if exhausted else {})})
-        if _is_complete(parsed) and not exhausted:
+        # 已有可用答案和步骤就直接结束；即使服务端报告 length，也不压缩覆盖。
+        if _is_complete(parsed):
+            complete_entry = {"attempt": attempts, "status": "success",
+                              "response_chars": len(resp or "")}
+            finish_reason = getattr(resp, "finish_reason", None)
+            if finish_reason is not None:
+                complete_entry["finish_reason"] = str(finish_reason)
+            trace.append(complete_entry)
             return _reasoning_state(parsed, trace, attempts, resp,
                                     examples_text, cards_text)
-        # deadline for nothing. 2026-08-09 评委报告模式 A：这类"耗尽后普通重试"
-        # 常因预算不足被跳过，约 35 题四章节全空。现改为 prefill 压缩重试：助手
-        # 种子抑制私有推理，~150s 即产出可解析章节（阶段性熔断，评委建议 4）。
+
+        exhaustion_reason = _token_exhaustion_reason(
+            resp, parsed, max_tokens=CONFIG["max_tokens"]["reasoning"])
+        exhausted = bool(exhaustion_reason)
+        entry = {"attempt": attempts, "status": "failed",
+                 "response_chars": len(resp or "")}
         if exhausted:
+            entry.update({"reason": exhaustion_reason,
+                          "raw_excerpt": _raw_excerpt(resp)})
+        else:
+            entry["reason"] = "incomplete_but_token_limit_not_confirmed"
+            finish_reason = getattr(resp, "finish_reason", None)
+            completion_tokens = getattr(resp, "completion_tokens", None)
+            if finish_reason is not None:
+                entry["finish_reason"] = str(finish_reason)
+            if completion_tokens is not None:
+                entry["completion_tokens"] = completion_tokens
+        trace.append(entry)
+        # Missing deliverables justify completion independently of provider
+        # metadata. Reuse the draft instead of buying another full exploration.
+        if exhausted or not parsed.get("answer"):
             attempts += 1
-            failure_text = (
-                "因长度超限只写出了部分分析/步骤，尚未形成完整最终答案"
-                if exhaustion_reason != "token_budget_exhausted_before_sections"
-                else "因长度超限被截断，没有产出任何章节"
-            )
             compressed_resp, fail_reason = _compressed_reasoning_retry(
-                deps, hinted_base, failure=failure_text, coverage=coverage_clause)
+                deps, hinted_base,
+                failure=("已达到长推理输出 token 上限，但回答被截断且结构不完整" if exhausted
+                         else "上一轮有推导但缺少可提交的最终答案"),
+                coverage=coverage_clause, previous_response=resp)
             if compressed_resp is None:
                 trace.append({"attempt": attempts, "status": "skipped",
                               "reason": fail_reason or "compressed_retry_failed"})
@@ -817,15 +697,15 @@ def reasoning_agent_node(state, config):
                 parsed["answer_source"] = parsed.get("answer_source") or "compressed_prefill"
             trace.append({"attempt": attempts,
                           "status": "success" if _is_complete(compressed_parsed) else "failed",
-                          "reason": "compressed_prefill_after_" + exhaustion_reason,
+                          "reason": "compressed_prefill_after_" + (exhaustion_reason or "missing_answer"),
                           "response_chars": len(resp or "")})
             if _is_complete(compressed_parsed):
                 return _reasoning_state(parsed, trace, attempts, resp,
                                         examples_text, cards_text)
             break
-        prompt = (base_prompt + "\n\n注意：上一次输出缺少必需章节（必须含 '## 问题分析'、'## 详细解题步骤'、"
-                  "'## 最终答案'）。'## 最终答案' 下必须按题面要求完整列出各字段/各问项的结果"
-                  "（含检验结论、区间上下限、全部枚举对象等），不得只给单个数值。请重新严格按格式输出。")
+        if parsed.get("answer") and question_mode != "proof":
+            return _reasoning_state(parsed, trace, attempts, resp, examples_text, cards_text)
+        prompt = (base_prompt + "\n\n补齐缺失的证明步骤，保留已有最终答案；交付范围以题面要求为准。")
     return _reasoning_state(parsed, trace, attempts, resp,
                             examples_text, cards_text)
 

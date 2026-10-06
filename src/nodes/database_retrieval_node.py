@@ -18,7 +18,6 @@ from utils.retrieval_relation import (
     select_for_injection,
 )
 from utils.hybrid_retriever import HybridRetriever
-from utils.knowledge_card_retriever import KnowledgeCardRetriever
 
 _RETRIEVER_INIT_LOCK = threading.Lock()
 # 多个评测线程可能并发访问客户端；保护一次完整检索事务。
@@ -31,8 +30,8 @@ def database_retrieval_node(state: Dict[str, Any], config: Dict) -> Dict[str, An
     The retriever recalls a larger candidate set, then applies relation bands
     using dense similarity only. A high-similarity label does not itself permit
     answer reuse: the normalized problem must match exactly and an answer must
-    be present. Related records and sparse-only lexical matches are method-only
-    references and cannot enter the dense-similarity bands.
+    be present. Related records are method-only references. Sparse-only lexical
+    matches without dense evidence are irrelevant and are not injected.
 
     Returns:
         Dict with 'retrieved_examples': List[Dict] containing:
@@ -116,7 +115,7 @@ def database_retrieval_node(state: Dict[str, Any], config: Dict) -> Dict[str, An
         # 不锁定答案；关系标签只用于安全筛选和 trace。
         relation_counts = {
             name: sum(1 for item in candidates if item.get("relation") == name)
-            for name in ("high_similarity", "related", "sparse_reference", "irrelevant")
+            for name in ("high_similarity", "related", "irrelevant")
         }
         logger.info(
             f"[db_retrieval] recalled={len(candidates)} injected={len(examples)} "
@@ -134,26 +133,6 @@ def database_retrieval_node(state: Dict[str, Any], config: Dict) -> Dict[str, An
                 "hybrid": hybrid_used,
             },
         }
-        if bool(CONFIG.get("knowledge_cards_enabled", True)) and deps.skills_loader is not None:
-            try:
-                cards = getattr(deps.skills_loader, "_knowledge_card_retriever", None)
-                if cards is None:
-                    cards = KnowledgeCardRetriever(deps.skills_loader, db_client)
-                    deps.skills_loader._knowledge_card_retriever = cards
-                primary = str(state.get("category") or "")
-                alternate = [str(name) for name in (state.get("alternate_categories") or [])
-                             if str(name)]
-                subjects = [primary] + [name for name in alternate if name != primary]
-                with _RETRIEVAL_DB_LOCK:
-                    result["knowledge_cards"] = cards.query(
-                        problem,
-                        subject=primary,
-                        subjects=subjects[:3],
-                        limit=int(CONFIG.get("knowledge_card_limit", 3) or 3),
-                    )
-            except Exception as cards_error:  # noqa: BLE001 - cards are additive only.
-                logger.warning(f"[db_retrieval] knowledge cards skipped: {cards_error!r}")
-                result["knowledge_cards"] = []
         return result
 
     except Exception as e:
@@ -183,7 +162,7 @@ def database_retrieval_node(state: Dict[str, Any], config: Dict) -> Dict[str, An
                     "counts": {
                         name: sum(1 for item in fallback_candidates
                                   if item.get("relation") == name)
-                        for name in ("high_similarity", "related", "sparse_reference", "irrelevant")
+                        for name in ("high_similarity", "related", "irrelevant")
                     },
                     "fallback": True,
                 },

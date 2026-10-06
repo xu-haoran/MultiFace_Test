@@ -1,21 +1,4 @@
-"""Select the parts of a skill document that match the problem, not just its head.
-
-The agent nodes cap the skill document at a few thousand characters
-(`skill_document[:3000]` in the reasoning branch). That cap is positional, so a
-document longer than the cap silently delivers only its opening modules regardless
-of what the problem is about.
-
-This became a real defect when 非基础及进阶课程 grew from 7.9k to 8.9k characters:
-its number-theory and game-theory modules sit at offsets 3404-8949, entirely past
-the 3000-character window, so a game-theory problem received modules on Lebesgue
-measure and functional analysis and none of the material written for it.
-
-Selection is by `## 模块` heading, scored on term overlap with the problem
-statement. The document's own leading preamble is always kept, and the remaining
-budget goes to the best-matching modules in document order. When nothing matches,
-the behaviour degrades to the old head-truncation, so a document without module
-headings is unaffected.
-"""
+"""Select complete, relevant local knowledge cards within a prompt budget."""
 
 from __future__ import annotations
 
@@ -44,7 +27,7 @@ import re
 #: 一个真模块（复分析模块9 因此膨胀到 24201 字符，其词表成为全集、对所有题霸榜），
 #: 文档侧已统一改题为 ``## 模块速查：…``（与离散数学/高等代数惯例一致）。
 _MODULE_RE = re.compile(
-    r"^(?:#{2,3}\s*模块|##\s*(?:\d+\s*[.)、:：-]|\d+\s+(?:[一-鿿]|[A-Za-z])|"
+    r"^(?:#{2,3}\s*(?:模块|知识卡：)|##\s*(?:\d+\s*[.)、:：-]|\d+\s+(?:[一-鿿]|[A-Za-z])|"
     r"[一二三四五六七八九十百]+\s*[、.)：:-]))",
     re.MULTILINE,
 )
@@ -147,8 +130,7 @@ def _retrieval_bonus(module: str, problem: str) -> int:
             hit = tok in text
         if hit:
             hits += 1
-            if hits >= 6:
-                break
+
     # 单词元命中只记 1 分：一个泛词不足以断言主题相关，不得压过正文模块的
     # 实词匹配（同分时文档序在前的正文模块优先）。多词元命中才给满权重。
     return hits if hits < 2 else 2 * hits
@@ -195,78 +177,59 @@ def select_script_excerpt(script: str, problem: str, limit: int) -> str:
 def select_skill_excerpt(document: str, problem: str, limit: int) -> str:
     """At most `limit` characters of `document`, biased toward `problem`'s topic.
 
-    Falls back to `document[:limit]` when the document has no module structure or
-    nothing scores, so this can replace a bare slice without changing that case.
+    Selects relevant complete cards within the budget; oversized units are omitted.
     """
     return _select(document, problem, limit, _MODULE_RE, sanitize=True)
 
 
+def selected_card_ids(excerpt: str) -> list[str]:
+    """IDs of complete cards actually injected, for auditable prompt traces."""
+    return re.findall(r"^## 知识卡：([^ |\n]+)", excerpt or "", re.MULTILINE)
+
+
 def _select(document: str, problem: str, limit: int, boundary, *, sanitize: bool = True) -> str:
-    finish = sanitize_answer_anchors if sanitize else (lambda value: value)
-    text = document or ""
+    """Select complete units only; never truncate a theorem or executable block."""
     if limit <= 0:
         return ""
-    if len(text) <= limit:
-        return finish(text)
-
+    finish = sanitize_answer_anchors if sanitize else (lambda value: value)
+    text = document or ""
     preamble, modules = _split_modules(text, boundary)
     if not modules:
-        return finish(text[:limit])
-
+        # An unstructured oversized document has no safe truncation boundary.
+        return finish(text) if len(finish(text)) <= limit else ""
+    head = finish(preamble).strip()
+    if len(head) > min(300, limit):
+        head = ""
     problem_terms = _terms(problem)
-    scored = [(index, _score(module, problem_terms) + _cue_bonus(module, problem)
-               + _retrieval_bonus(module, problem))
-              for index, module in enumerate(modules)]
-    if not any(score for _, score in scored):
-        return finish(text[:limit])
-
-    # Universal sections (跨学科通用方法论) apply to every problem, so they compete on
-    for index, module in enumerate(modules):
-        if _UNIVERSAL_HEADING_RE.match(module):
-            scored[index] = (index, scored[index][1] + 1)
-
-    ranked = [pair for pair in sorted(scored, key=lambda pair: (-pair[1], pair[0]))
-              if pair[1] > 0]
-    # 整册无模块结构、仅在文末追加了速查条目的手册：preamble 是全部正文，本身就
-    # 超过预算。此时头部（手册的总纲与核心方法）与命中的速查模块平分预算，谁都
-    # 不独占。有模块结构的手册 preamble 均远小于预算，走不进这个分支。
-    if len(preamble) >= limit:
-        # 头部封顶 1200：整册头部再长，也要给命中的第 2、3 名条目留全量空间
-        # （2026-08-09：排序配对条目曾差 9 字符被挤出）。
-        head = preamble[: min(limit // 2, 1200)]
-        pieces, room = [], limit - len(head)
-        for rank_pos, (index, _) in enumerate(ranked):
-            if room <= 60:
-                break
-            module = modules[index]
-            if len(module) > room:
-                # 只有榜首允许截断；次名截断会剪掉条目尾部的收尾配方，宁可跳过
-                # 换一个能整条放下的。
-                if rank_pos == 0:
-                    pieces.append((index, module[:room]))
-                    room = 0
-                continue
-            pieces.append((index, module))
-            room -= len(module)
-        # ``作答模板/判分口径`` lines could leak into an otherwise no-exact run.
-        return finish(head + "".join(piece for _, piece in sorted(pieces)))
-    best = ranked[0][0]
-    room = max(0, limit - len(preamble))
-    if len(modules[best]) > room:
-        return finish(
-            (preamble + modules[best][:room]) if room else modules[best][:limit]
-        )
-
-    kept = [best]
-    used = len(preamble) + len(modules[best])
-    for index, _ in ranked[1:]:
-        length = len(modules[index])
-        if used + length > limit:
+    ranked = sorted(enumerate(modules), key=lambda item: (
+        -(_score(item[1], problem_terms) + _cue_bonus(item[1], problem)
+          + _retrieval_bonus(item[1], problem)), item[0]))
+    pieces = [head] if head else []
+    used = len(head)
+    for index, module in ranked:
+        score = (_score(module, problem_terms) + _cue_bonus(module, problem)
+                 + _retrieval_bonus(module, problem))
+        if score <= 0:
             continue
-        kept.append(index)
-        used += length
-
-    parts = [preamble] + [modules[index] for index in sorted(kept)]
-    excerpt = "".join(parts)
-    return finish(excerpt if len(excerpt) <= limit else excerpt[:limit])
-
+        unit = finish(module).strip()
+        if module.startswith("## 知识卡："):
+            match = re.match(r"## 知识卡：([^ |\n]+)", module)
+            if not match or f"<!-- END_CARD {match[1]} -->" not in module:
+                continue  # malformed cards must not inject partial claims
+            required = ("前提", "公式与结论", "反例与边界", "记号", "验证", "来源", "适用范围")
+            if not all(f"- {field}：" in unit for field in required):
+                continue
+            scope = re.search(r"^- 适用范围：(.+)$", unit, re.MULTILINE)
+            if scope and "教材约定" in scope[1]:
+                source = re.search(r"^- 来源：(.+)$", unit, re.MULTILINE)
+                matches = re.search(r"^- 约定匹配词：(.+)$", unit, re.MULTILINE)
+                if (not source or re.search(r"未知|未核实|项目原手册|项目数学推导", source[1])
+                        or not matches or not any(token.strip() in problem
+                            for token in matches[1].split() if len(token.strip()) >= 3)):
+                    continue
+        cost = len(unit) + (2 if pieces else 0)
+        if used + cost <= limit:
+            pieces.append(unit)
+            used += cost
+    # No relevant complete card is preferable to unrelated handbook openings.
+    return "\n\n".join(pieces)

@@ -16,6 +16,7 @@ runs/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.flow-test-deps/
 
 # 本地环境与编辑器文件
 .env
@@ -30,3 +31,7 @@ Thumbs.db
 # 可重新生成的数据导入暂存文件；正式 Chroma 数据库仍需提交
 data/database/public_import/staged_records.jsonl
 data/database/**/staged_records.jsonl
+
+# 可恢复的本地知识库迁移备份（不提交大型二进制副本）
+data/database_backups/
+data/skill_archive/

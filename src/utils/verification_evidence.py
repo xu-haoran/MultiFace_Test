@@ -14,6 +14,7 @@ import re
 
 from utils.stdout_miner import mine_stdout_answer
 from utils.verification_authenticity import assess_verification_authenticity
+from utils.python_contract import read_program_result, contract_answer_is_computed, DRIVER_MARKER
 
 
 _STATUS_RE = re.compile(
@@ -78,6 +79,12 @@ def parse_verification_evidence(
     """Add conservative evidence fields without changing executor success semantics."""
     result = dict(output or {})
     stdout = str(result.get("stdout") or "")
+    structured = read_program_result(stdout) if result.get("success") else None
+    if structured:
+        result["answer"] = str(structured.get("answer") or "").strip()
+        result["answer_source"] = "program_contract"
+        result["checks"] = structured["checks"]
+        result["program_evidence"] = structured.get("evidence", "")
 
     # 低置信答案通道：执行器只认 "最终答案:" 标记；标记缺失但 stdout 明确给出
     # 结论时（"f(2015)=3024"、"both match binomial(2k,k)^2"），把它挖出来作候选。
@@ -108,6 +115,7 @@ def parse_verification_evidence(
         elif not contradictions:
             contradictions.append("验证状态: FAIL")
 
+    numerical_contradictions = []
     candidate_value = _scalar(candidate_answer or result.get("answer", ""))
     if candidate_value is not None:
         for match in _MAX_RATIO_RE.finditer(stdout):
@@ -116,6 +124,7 @@ def parse_verification_evidence(
                 text = match.group(0).strip()
                 if text not in contradictions:
                     contradictions.append(text)
+                numerical_contradictions.append(text)
 
     if contradictions:
         status = "contradict"
@@ -130,7 +139,8 @@ def parse_verification_evidence(
 
     # 反伪造：不做计算却宣称 PASS 的代码，其 support 不构成数学证据。
     # 只降级 support（contradict 的反例本身就是计算产物，不受权威引用污染）。
-    authenticity = assess_verification_authenticity(code, stdout, problem) if code else \
+    generated_code = str(code or "").split(DRIVER_MARKER, 1)[0]
+    authenticity = assess_verification_authenticity(generated_code, stdout, problem) if code else \
         {
             "fabricated": False,
             "reasons": [],
@@ -150,7 +160,71 @@ def parse_verification_evidence(
     # trusted=False 的 Python 答案在下游一律不参与答案选择。
     # 没有 code 可查时不做有罪推定：判定权交回旧语义（真实运行中 python_output
     # 带答案必然伴随 code，无 code 只出现在夹具与空分支）。
-    trusted = bool(authenticity.get("verified")) if code else True
+    trusted = bool(result.get("success") and authenticity.get("verified")) if code else bool(
+        result.get("success") and str(result.get("answer") or "").strip())
+    if structured:
+        checks = structured["checks"]
+        # Metadata is a declaration, not proof. Keep static authenticity gates.
+        computed = contract_answer_is_computed(generated_code)
+        decisive = any(isinstance(c, dict) and c.get("passed") is True
+                       and c.get("scope") in {"exact", "universal", "counterexample"}
+                       and c.get("target") in {"premise", "reasoning_candidate", "python_candidate"}
+                       and c.get("relation") in {"support", "contradict"}
+                       and (c.get("target") != "reasoning_candidate" or (
+                           candidate_answer and str(c.get("candidate_answer") or "").strip()
+                           == str(candidate_answer).strip())) for c in checks)
+        trusted = trusted and computed and decisive
+        authenticity["contract_answer_computed"] = computed
+        if not computed:
+            authenticity.setdefault("strength_reasons", []).append("接口答案未依赖可识别的数学计算")
+        contradictions = []
+        relevant = []
+        premise_counterexample = False
+        self_failure = False
+        for check in checks:
+            if not isinstance(check, dict) or not isinstance(check.get("passed"), bool):
+                continue
+            target, relation, scope = (check.get(k) for k in ("target", "relation", "scope"))
+            if target in {"python_candidate", "program"} and relation == "contradict":
+                self_failure = True
+            if check["passed"] is False:
+                if target in {"python_candidate", "program"}:
+                    self_failure = True
+                # A failed support/check procedure is not a successful
+                # refutation. Contradictions require passed=True below.
+                continue
+            if target == "premise" and relation == "contradict" and scope == "counterexample":
+                premise_counterexample = True
+            if target == "reasoning_candidate" and candidate_answer and str(
+                    check.get("candidate_answer") or "").strip() == str(candidate_answer).strip():
+                relevant.append(check)
+                if relation == "contradict" and scope in {"exact", "universal", "counterexample"}:
+                    contradictions.append(str(check.get("description") or ""))
+            elif target == "python_candidate" and relation == "support" and scope in {"exact", "universal"}:
+                relevant.append(check)
+        if self_failure:
+            trusted = False
+        if contradictions and trusted:
+            status = "contradict"
+        elif trusted and (any(c.get("relation") == "support" for c in relevant) or (
+                premise_counterexample and str(result.get("answer")).strip() in {"错误", "错", "False", "false"})):
+            status = "support"
+        else:
+            status = "inconclusive"
+        if not trusted:
+            contradictions = []
+        result["evidence_target"] = "reasoning_candidate" if contradictions else (
+            "premise" if premise_counterexample else "python_candidate" if relevant else "unspecified")
+        result["evidence_scope"] = sorted({str(c.get("scope")) for c in checks if isinstance(c, dict)})
+        evidence_summary = str(structured.get("evidence") or "")
+    else:
+        result["evidence_target"] = "reasoning_candidate" if numerical_contradictions and candidate_answer else "unspecified"
+        result["evidence_scope"] = ["legacy_unspecified"]
+        # A textual 'counterexample' cannot identify which proposition was disproved.
+        if status == "contradict":
+            contradictions = numerical_contradictions if candidate_answer and trusted else []
+            if not contradictions:
+                status = "inconclusive"
     if status == "support" and not trusted:
         status = "inconclusive"
         strength_reasons = authenticity.get("strength_reasons") or []
@@ -160,6 +234,10 @@ def parse_verification_evidence(
                 + (f"。原声明不作为验证证据。" if evidence_summary else "")
             )
     result["python_verification_trusted"] = trusted
+    from utils.flow_policy import knowledge_candidate_eligible
+    from utils.problem_profile import classify_question_mode
+    eligible = knowledge_candidate_eligible(problem, classify_question_mode(problem))
+    result["semantic_candidate"] = str(result.get("answer") or "").strip() if not trusted and eligible else ""
 
     result.update({
         "evidence_status": status,

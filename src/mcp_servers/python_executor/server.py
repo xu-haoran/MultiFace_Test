@@ -56,6 +56,14 @@ def execute_python(code: str, timeout: int = 30) -> dict:
             "PYTHONUTF8": "1",
             "PYTHONHASHSEED": "0",
         }
+        # Windows cryptographic/random and native-library initialization needs
+        # the system directories. Preserve only runtime paths, not credentials.
+        for key in ("SYSTEMROOT", "WINDIR", "TEMP", "TMP", "USERPROFILE", "COMSPEC", "PATHEXT"):
+            if key in os.environ:
+                env[key] = os.environ[key]
+        # Ten independent programs should not each create a full BLAS pool.
+        env.update(OPENBLAS_NUM_THREADS="1", OMP_NUM_THREADS="1", MKL_NUM_THREADS="1",
+                   NUMEXPR_NUM_THREADS="1")
         # errors="replace"：子进程被超时 kill/原生扩展崩溃时可能写到多字节字符中间，
         # 管道 EOF 落在残缺字节上；严格解码会让 capture_output 的 reader 线程抛
         # UnicodeDecodeError（subprocess.py _readerthread），整条 stdout 丢失。

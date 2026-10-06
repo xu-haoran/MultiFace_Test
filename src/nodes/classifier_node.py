@@ -196,6 +196,8 @@ def _classify_prefilled(deps, prompt, all_categories):
             prefix=CLASSIFICATION_PREFILL,
             temperature=CONFIG["temperatures"]["classifier"],
             max_tokens=CONFIG["max_tokens"]["classifier"],
+            top_p=CONFIG["top_p"]["classifier"],
+            top_k=CONFIG["top_k"]["classifier"],
             logger=deps.logger,
             time_budget=deps.time_budget,
             expected_call_seconds=5,
@@ -228,6 +230,8 @@ def _classify_plain(deps, prompt, all_categories):
             messages=[{"role": "user", "content": prompt}],
             temperature=CONFIG["temperatures"]["classifier"],
             max_tokens=CONFIG["max_tokens"]["classifier_fallback"],
+            top_p=CONFIG["top_p"]["classifier"],
+            top_k=CONFIG["top_k"]["classifier"],
             logger=deps.logger,
             time_budget=deps.time_budget,
             expected_call_seconds=_PLAIN_CALL_SECONDS,
@@ -631,18 +635,8 @@ def classifier_node(state, config):
             problem, all_categories, result[0], result[1],
             _rank_alternate_categories(sl, problem, result[0], all_categories), stages
         )
-    # 预填充无法解析时才使用完整分类，并先检查剩余预算。
-    if not (time_budget and time_budget.fast_path()):
-        stages.append("llm_plain")
-        plain = _classify_plain(deps, prompt, all_categories)
-        if plain:
-            # 已识别出合法学科时，即使置信度低也优先保留模型判断。
-            stages.append("low_confidence_accepted" if plain[1] < threshold else "llm_plain_accepted")
-            return _decision_payload(
-                problem, all_categories, plain[0], plain[1],
-                _rank_alternate_categories(sl, problem, plain[0], all_categories), stages
-            )
-
+    # Classification selects references, not mathematical answers. An unreadable
+    # short call goes straight to existing local ranking instead of a long retry.
     stages.append("deterministic_fallback")
     fallback = _deterministic_fallback(sl, problem, all_categories, deps.logger)
     return _decision_payload(

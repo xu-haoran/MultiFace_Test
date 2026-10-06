@@ -30,14 +30,9 @@ _OPTION_RE = re.compile(r"(?i)(?:\b[A-E]\b|[Ａ-Ｅ])")
 
 
 def objective_needs_independent_python(problem: str, mode: str) -> bool:
-    """Return whether the objective item should fan out to the Python branch.
-
-    We deliberately route every objective mode.  A conceptual item may still
-    yield ``INCONCLUSIVE`` from Python, but the branch is then harmless and the
-    reasoning answer remains available.  Computable blanks, true/false claims,
-    and formula-heavy choices get a genuine second attempt.
-    """
-    return bool(problem and is_objective_mode(mode))
+    """Route executable objective work; concepts use source-based review."""
+    from utils.flow_policy import python_verification_needed
+    return bool(problem and is_objective_mode(mode) and python_verification_needed(problem, mode))
 
 
 def _ast_features(code: str) -> tuple[bool, bool, bool]:
@@ -66,7 +61,10 @@ def objective_code_is_independent(code: str, mode: str) -> bool:
     merely prints a remembered option; rejecting a few valid but opaque programs
     is safer than allowing an answer anchor into the consensus path.
     """
-    text = str(code or "")
+    from utils.python_contract import DRIVER_MARKER, contract_answer_is_computed
+    text = str(code or "").split(DRIVER_MARKER, 1)[0]
+    if not contract_answer_is_computed(text):
+        return False
     if not text.strip() or not _MATH_CALL_RE.search(text):
         return False
     has_compare, has_call, has_assignment = _ast_features(text)

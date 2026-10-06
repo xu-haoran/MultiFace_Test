@@ -524,8 +524,6 @@ class AnswerMatcher:
                     "text_similarity": 0.0,
                     "python_success": AnswerMatcher._python_verification_succeeded(
                         python_result),
-                    "reasoning_validation_points": len(
-                        (reasoning_result or {}).get("validation_points") or []),
                 },
             }
 
@@ -538,8 +536,6 @@ class AnswerMatcher:
             if detail["method"] in {"symbolic", "structured_symbolic"} else 0.0,
             "text_similarity": detail["text_similarity"],
             "python_success": python_success,
-            "reasoning_validation_points": len(
-                (reasoning_result or {}).get("validation_points") or []),
         }
         comparison_verdict = detail["verdict"]
         if comparison_verdict is True and detail["confidence"] >= 0.8:

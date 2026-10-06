@@ -10,7 +10,7 @@ what we already have.
 
 from config import CONFIG
 from utils.deps import get_deps
-from utils.retry_affordability import DEFAULT_ATTEMPT_COST_S, last_attempt_cost
+from utils.retry_affordability import last_attempt_cost
 
 
 def _deps(config):
@@ -24,22 +24,19 @@ def reconciliation_round_limit(config) -> int:
     deps = _deps(config)
     budget = getattr(deps, "token_budget", None)
     clock = getattr(deps, "time_budget", None)
-    if clock is not None and clock.fast_path():
+    if clock is not None and clock.closeout_started():
         return 1
     if budget and budget.is_tight():
         return 1
     return CONFIG["reconciliation_max_rounds"]
 
 
-def projected_solving_seconds(time_budget) -> float:
+def projected_solving_seconds(time_budget, targets=None) -> float:
     """Estimate one more parallel reasoning/Python pass from observed costs."""
     if time_budget is None:
         return 0.0
-    return max(
-        last_attempt_cost(time_budget, "reasoning"),
-        last_attempt_cost(time_budget, "python"),
-        DEFAULT_ATTEMPT_COST_S,
-    )
+    return max(last_attempt_cost(time_budget, target)
+               for target in (targets or ["reasoning", "python"]))
 
 
 def reconciliation_retry_available(state, config) -> bool:
@@ -49,5 +46,7 @@ def reconciliation_retry_available(state, config) -> bool:
         return False
     deps = _deps(config)
     clock = getattr(deps, "time_budget", None)
-    return clock is None or clock.can_afford(projected_solving_seconds(clock))
+    target = (state.get("validation_details") or {}).get("repair_target")
+    targets = [target] if target in {"reasoning", "python"} else None
+    return clock is None or clock.can_afford(projected_solving_seconds(clock, targets))
 

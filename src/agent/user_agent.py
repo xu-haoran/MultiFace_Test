@@ -54,6 +54,27 @@ class ReasoningAgent:
 
     def _build_trace(self, state: dict) -> list:
         trace = []
+        trace.append({"step": "flow_policy",
+                      "python_verification_enabled": state.get("python_verification_enabled", False),
+                      "verification_task": state.get("verification_task", {}),
+                      "candidate_health": state.get("candidate_health", {}),
+                      "retry_targets": state.get("retry_targets", []),
+                      "retrieval_cached": "retrieved_examples" in state})
+        trace.append({"step": "candidate_normalization",
+                      "source": "src/nodes/normalize_candidates_node.py::normalize_candidates_node",
+                      "candidate_health": state.get("candidate_health", {}),
+                      "python_evidence_status": state.get("python_evidence_status", "inconclusive")})
+        if state.get("submission_check"):
+            trace.append({"step": "submission", **state["submission_check"]})
+        if state.get("knowledge_review"):
+            trace.append({"step": "knowledge_review", **state["knowledge_review"]})
+        po = state.get("python_output") or {}
+        trace.append({"step": "evidence_scope", "target": po.get("evidence_target", "unspecified"),
+                      "scope": po.get("evidence_scope", []), "checks": po.get("checks", []),
+                      "semantic_candidate": po.get("semantic_candidate", ""),
+                      "python_verification_trusted": po.get("python_verification_trusted", False)})
+        if state.get("errors"):
+            trace.append({"step": "node_errors", "errors": state["errors"]})
         if state.get("category"):
             trace.append({
                 "step": "classification",
@@ -114,11 +135,6 @@ class ReasoningAgent:
                             "injection": "仅作解题过程参考；文本启发式过滤，要求按当前题独立推导",
                             "max_injected": related_limit,
                         },
-                        "sparse_reference": {
-                            "condition": "dense_similarity unavailable and sparse_similarity > 0",
-                            "injection": "仅作关键词命中的方法参考，不提供答案",
-                            "max_injected": related_limit,
-                        },
                         "irrelevant": {
                             "condition": f"dense_similarity <= {related_threshold:.2f} or unavailable",
                             "injection": "不注入，仅保留检索轨迹",
@@ -127,7 +143,7 @@ class ReasoningAgent:
                     },
                     "selection_policy": (
                         "优先注入排名最高的一条 high_similarity 完整参考解，不以 answer_safe 决定是否展示；"
-                        "没有 high_similarity 时，related/关键词候选仅作方法参考"
+                        "没有 high_similarity 时，仅 related 候选作为方法参考"
                         f"（最多 {related_limit} 条）"
                     ),
                     "reference_block_chars": {
@@ -188,7 +204,6 @@ class ReasoningAgent:
                 "attempts": state.get("reasoning_attempts", 0),
                 "steps_count": len(rr.get("steps", [])),
                 "thinking": {
-                    "validation_points_count": len(rr.get("validation_points", [])),
                     "answer_source": rr.get("answer_source", "parsed_sections"),
                 },
                 # 记录解析后的推理输出，便于本地核对。
@@ -196,6 +211,8 @@ class ReasoningAgent:
                 "tools": [
                     {
                         "name": "skill_document",
+                        "source": "resources/skills",
+                        "card_ids": state.get("reasoning_skill_cards", []),
                         "category": state.get("category", ""),
                         "purpose": "加载对应数学领域 skill 文档作为解题参考。",
                     },
@@ -207,7 +224,7 @@ class ReasoningAgent:
                             state.get("reasoning_knowledge_card_chars", 0) or 0),
                         "purpose": "题库相似题与解答，随 skill 文档一并进入推理提示词。",
                         "source_fields": [
-                            "retrieved_examples", "knowledge_cards",
+                            "retrieved_examples",
                             "reasoning_reference_chars", "reasoning_knowledge_card_chars",
                         ],
                     },
@@ -216,7 +233,7 @@ class ReasoningAgent:
                         "attempts": self._structured_attempts(
                             state.get("reasoning_trace", [])),
                         "max_attempts_used": state.get("reasoning_attempts", 0),
-                        "output_schema": ["analysis", "steps", "answer", "validation_points"],
+                        "output_schema": ["analysis", "steps", "answer"],
                         "output": self._structured_reasoning_output(rr),
                     },
                 ],
@@ -256,9 +273,14 @@ class ReasoningAgent:
                             state.get("python_knowledge_card_chars", 0) or 0),
                         "purpose": "题库相似题与解答，随验证脚本一并进入 Python 提示词。",
                         "source_fields": [
-                            "retrieved_examples", "knowledge_cards",
+                            "retrieved_examples",
                             "python_reference_chars", "python_knowledge_card_chars",
                         ],
+                    },
+                    {
+                        "name": "local_skill_cards",
+                        "source": "resources/skills",
+                        "card_ids": state.get("python_skill_cards", []),
                     },
                     {
                         "name": "python_code_generation",
@@ -357,7 +379,7 @@ class ReasoningAgent:
                 ],
             })
         if state.get("final_response"):
-            vote = state.get("coordination_vote_summary") or {}
+            coordination = state.get("coordination_summary") or {}
             trace.append({
                 "step": "coordination",
                 "source": "src/nodes/coordinator_node.py::coordinator_node",
@@ -370,13 +392,11 @@ class ReasoningAgent:
                         "name": "coordinator_llm",
                         "content_length": len(state.get("coordination_detail", "")),
                         "skipped_for_locked_answer": bool(state.get("answer_locked")),
-                        "vote": {
-                            "requested": vote.get("requested", 0),
-                            "attempted": vote.get("attempted", 0),
-                            "valid_candidates": vote.get("valid_candidates", 0),
-                            "majority": vote.get("majority", False),
-                            "selection": vote.get("selection", "not_run"),
-                            "reference_review": vote.get("reference_review", "not_run"),
+                        "answer_generation": {
+                            "status": coordination.get("generation", "not_run"),
+                            "candidate_valid": coordination.get("candidate_valid", False),
+                            "selection": coordination.get("selection", "not_run"),
+                            "reference_review": coordination.get("reference_review", "not_run"),
                         },
                     },
                     {
@@ -427,7 +447,6 @@ class ReasoningAgent:
             "analysis": result.get("analysis", ""),
             "steps": result.get("steps", []),
             "answer": result.get("answer", ""),
-            "validation_points": result.get("validation_points", []),
             "answer_source": result.get("answer_source", "parsed_sections"),
             "raw_response_excerpt": self._excerpt(
                 result.get("raw_response", "")),

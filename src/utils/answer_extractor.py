@@ -12,10 +12,7 @@ class AnswerExtractor:
 
     @staticmethod
     def extract_from_text(text: str):
-        if not text:
-            return None
-        m = re.search(r"(?:最终答案|答案|结论)[：:]\s*(.+?)(?:\n|$)", text)
-        return m.group(1).strip() if m else None
+        return extract_answer_fallback(text) or None
 
 
 def extract_boxed_answer(text: str) -> str:
@@ -54,8 +51,8 @@ def extract_boxed_answer(text: str) -> str:
 def extract_answer_fallback(text: str) -> str:
     """Recover an answer when the model omitted the Markdown section contract.
 
-    The order is conservative: a final boxed value, an explicit answer/结论 line,
-    then the last payload-bearing line.  This function never tries to evaluate a
+    The order is conservative: a final answer section, a boxed value, then an
+    explicit answer/结论 line. This function never tries to evaluate a
     mathematical expression or invent a value; it only preserves model text.
 
     2026-08-09 评委报告模式 B：最后一层"任取带数字的行"曾把思维流碎片
@@ -68,16 +65,16 @@ def extract_answer_fallback(text: str) -> str:
 def extract_answer_fallback_with_source(text: str) -> tuple:
     """`extract_answer_fallback`，另返回命中层级。
 
-    层级标签供调用方区分置信度（2026-08-10 评委报告 4.2）：``boxed`` 与
-    ``labelled`` 是模型显式提交的结论（截断响应里出现也算有效产出）；
-    ``payload_line`` 是从散文里扫出的最后信息行，置信度与 salvage 同级——
-    耗尽判定必须把它视为"没有产出"，让压缩重试先行。
+    仅返回模型显式提交的 section/boxed/labelled 结论，不从推导行猜测答案。
     """
-    from utils.answer_cleanliness import looks_committed_result, looks_derivation_fragment
-
     source = str(text or "").strip()
     if not source:
         return "", ""
+    section = list(re.finditer(r"(?m)^##\s*最终答案\s*\n", source))
+    if section:
+        payload = re.split(r"(?m)^##\s", source[section[-1].end():], maxsplit=1)[0].strip()
+        if payload:
+            return payload, "section"
     boxed = extract_boxed_answer(source)
     if boxed:
         return boxed, "boxed"
@@ -89,13 +86,6 @@ def extract_answer_fallback_with_source(text: str) -> tuple:
     if labelled:
         return labelled[-1].group(1).strip().strip("`"), "labelled"
 
-    lines = [line.strip().strip("`*_ ") for line in source.splitlines() if line.strip()]
-    for line in reversed(lines):
-        if len(line) > 600 or re.match(r"^#{1,6}\s", line):
-            continue
-        if re.search(r"[=<>]|\\(?:frac|sqrt|boxed)|\d|正确|错误|成立|收敛|发散|存在|唯一", line):
-            if looks_committed_result(line) and not looks_derivation_fragment(line):
-                return line, "payload_line"
     return "", ""
 
 
@@ -181,8 +171,14 @@ def is_multi_part_problem(problem: str) -> bool:
     p = (problem or "").strip()
     if not p:
         return False
-    if len(_ENUM_MARK_RE.findall(p)) >= 2:
-        return True
+    enumerated = re.split(_ENUM_MARK_RE, p)
+    if len(enumerated) >= 3:
+        # Numbered premises are not numbered deliverables. Count only clauses
+        # beginning with an instruction, rather than occurrences of (1)/(2).
+        requests = sum(bool(re.match(r"\s*(?:%s|find|determine|compute|prove|show|describe)" % _ASK_VERB,
+                                     clause, re.I)) for clause in enumerated[1:])
+        if requests >= 2:
+            return True
     if "分别" in p and re.search(r"求|计算|写出|给出|证明|讨论", p):
         return True
     if _MULTI_ASK_RE.search(p):

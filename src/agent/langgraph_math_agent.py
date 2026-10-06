@@ -4,22 +4,27 @@ from graph.solving_subgraph import build_solving_subgraph
 from nodes import (
     input_node, classifier_node, reconciliation_node, semantic_arbiter_node,
     coordinator_node,
+    database_retrieval_node,
 )
 from utils.error_handler import node_wrapper
 from utils.database_client import DatabaseClient
+from nodes.submission_node import submission_node
 
 def build_math_agent_graph():
     g = StateGraph(MathAgentState)
     g.add_node("input", node_wrapper(input_node, "input"))
     g.add_node("classifier", node_wrapper(classifier_node, "classifier"))
+    g.add_node("database_retrieval", node_wrapper(database_retrieval_node, "database_retrieval"))
     g.add_node("solving", build_solving_subgraph())
     g.add_node("reconciliation", node_wrapper(reconciliation_node, "reconciliation"))
     g.add_node("semantic_arbiter", node_wrapper(semantic_arbiter_node, "semantic_arbiter"))
     g.add_node("coordinator", node_wrapper(coordinator_node, "coordinator"))
+    g.add_node("submission", node_wrapper(submission_node, "submission"))
 
     g.add_edge(START, "input")
     g.add_edge("input", "classifier")
-    g.add_edge("classifier", "solving")
+    g.add_edge("classifier", "database_retrieval")
+    g.add_edge("database_retrieval", "solving")
 
     def route_after_solving(state, config):
         if state.get("should_terminate", False):
@@ -46,7 +51,8 @@ def build_math_agent_graph():
     g.add_conditional_edges("semantic_arbiter", route_after_semantic_arbiter,
                             {"reconciliation": "reconciliation", "coordinator": "coordinator"})
 
-    g.add_edge("coordinator", END)
+    g.add_edge("coordinator", "submission")
+    g.add_edge("submission", END)
     return g.compile()
 
 class MathAgentGraph:

@@ -1,11 +1,7 @@
-"""Reconciliation: decide whether to retry the solving subgraph on mismatch.
+"""Deterministic repair routing using cached references.
 
-The retry decision remains deterministic because intern-s2-preview-397b unreliably
-returns structured JSON (it may emit a 'Thinking Process:' preamble):
-- python failed → retry, hint python with the error.
-- python succeeded but mismatch → retry, hint reasoning to match python's answer.
-- round limit reached → route to the evidence-constrained semantic selector.
-The selector itself can only choose an existing candidate or abstain.
+Single-branch failures repair only that branch. Mathematical conflicts recheck
+both independently; exhausted rounds go to selection among existing candidates.
 """
 from utils.reconciliation_policy import reconciliation_round_limit
 from utils.problem_profile import is_objective_mode
@@ -35,6 +31,7 @@ def reconciliation_node(state, config):
     evidence_context = _bounded(evidence_summary or "；".join(map(str, contradictions)))
     candidate = _bounded(rr.get("answer", ""), 2000)
     objective = is_objective_mode(state.get("question_mode", ""))
+    target = details.get("repair_target")
 
     if round_num >= max_rounds:
         recon_trace.append({"round": round_num, "action": "semantic_arbiter"})
@@ -44,6 +41,7 @@ def reconciliation_node(state, config):
             "reasoning_retry_hint": None,
             "python_retry_hint": None,
             "next_node": "semantic_arbiter",
+            "retry_targets": [],
             "validation_status": "reconciliation_exhausted_arbitrating",
         }
         if evidence_summary or contradictions or details.get("unresolved_contradiction"):
@@ -61,10 +59,21 @@ def reconciliation_node(state, config):
 
     rs_hint = None
     py_hint = None
+    if target in {"reasoning", "python"}:
+        hint = ("上一轮该分支失败或答案不完整。请依据原题重新求解，覆盖全部问项。"
+                + (f"执行错误：{_bounded(po.get('stderr'), 500)}" if target == "python" else ""))
+        recon_trace.append({"round": round_num, "action": f"repair_{target}",
+                            "targets": [target], "references_reused": True})
+        return {
+            "reconciliation_round": round_num, "reconciliation_trace": recon_trace,
+            "reasoning_retry_hint": hint if target == "reasoning" else None,
+            "python_retry_hint": hint if target == "python" else None,
+            "retry_targets": [target], "next_node": "solving",
+        }
     if not po.get("success"):
         err = (po.get("stderr") or "")[:300]
         py_hint = (f"上一次 Python 代码执行失败。错误：{err}。"
-                   f"请用 sympy 重新生成正确的 ```python``` 代码，结尾 print(\"最终答案:\", answer)。")
+                   f"请用 sympy 重新生成正确的 ```python``` 代码，使用固定 solve()/verify() 接口返回 answer、checks、evidence。")
         action = "retry_python"
     elif po.get("answer"):
         # 不把 Python 答案灌给推理侧（Python 可能因 API 误用而错，如 jordan_form 解包
@@ -78,6 +87,7 @@ def reconciliation_node(state, config):
                 "reasoning_retry_hint": "客观题答案冲突，请完全依据题面独立逐项核对，不要参考上一轮答案。",
                 "python_retry_hint": "客观题答案冲突，请独立重算并重新生成验证代码，不要参考上一轮答案。",
                 "next_node": "solving",
+                "retry_targets": ["reasoning", "python"],
             }
         rs_hint = ("你之前的推理答案与独立程序验证结果不一致。请重新独立推理，逐步复核每一步"
                    "关键计算，不要参考任何外部答案；严格按原格式输出（含 '## 问题分析'、"
@@ -85,7 +95,7 @@ def reconciliation_node(state, config):
         py_hint = (f"上一次代码计算结果为：{py_ans}，与理论推导不一致，代码逻辑可能有误。"
                    "请重点检查：多返回值函数的解包顺序（如 sympy 的 A.jordan_form() 返回 (P, J)，"
                    "Jordan 标准形是第二个返回值；A.diagonalize() 返回 (P, D)）、公式实现是否与题意"
-                   "一致。修正后只输出一个 ```python``` 代码块，结尾 print(\"最终答案:\", answer)。")
+                   "一致。修正后只输出一个 ```python``` 代码块，使用固定 solve()/verify() 接口返回 answer、checks、evidence。")
         if candidate:
             rs_hint += f" 当前待复核推理候选为：{candidate}。"
         if evidence_context:
@@ -104,5 +114,7 @@ def reconciliation_node(state, config):
         "reasoning_retry_hint": rs_hint,
         "python_retry_hint": py_hint,
         "next_node": "solving",
+        "retry_targets": (["reasoning", "python"]
+                          if state.get("python_verification_enabled", True) else ["reasoning"]),
     }
 

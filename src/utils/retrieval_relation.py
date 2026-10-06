@@ -212,17 +212,8 @@ def annotate_candidates(
             high_similarity_min=high_similarity_min,
             related_min_similarity=related_min_similarity,
         ))
-        sparse_similarity = item.get("sparse_similarity")
-        if dense_similarity is None and sparse_similarity is not None:
-            try:
-                has_lexical_evidence = float(sparse_similarity) > 0.0
-            except (TypeError, ValueError):
-                has_lexical_evidence = False
-            if has_lexical_evidence:
-                # Lexical-only evidence may suggest a method, but cannot enter
-                # the dense-similarity bands or authorize answer reuse.
-                item["relation"] = "sparse_reference"
-                item["relation_reason"] = "sparse_only_method_reference"
+        if dense_similarity is None:
+            item["relation_reason"] = "dense_similarity_unavailable"
         safe, reason = answer_reuse_safety(
             problem, item, high_similarity_min=high_similarity_min
         )
@@ -246,7 +237,7 @@ def select_for_injection(
         # answer_reuse_safety remains a separate gate for adopting its answer.
         return high_similarity[:1]
     method_only = [item for item in values
-                   if item.get("relation") in {"related", "sparse_reference"}]
+                   if item.get("relation") == "related"]
     if method_only and related_limit > 0:
         return method_only[:related_limit]
     return []

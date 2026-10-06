@@ -1,47 +1,43 @@
+"""Solve cached references; retries dispatch only requested branches."""
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 from state.math_agent_state import MathAgentState
-from nodes import reasoning_agent_node, python_agent_node, cross_validator_node, database_retrieval_node
+from nodes import reasoning_agent_node, python_agent_node, cross_validator_node
 from utils.error_handler import node_wrapper
-from utils.objective_verifier import objective_needs_independent_python
+from utils.flow_policy import python_verification_needed, verification_task
+from utils.problem_profile import is_objective_mode
+
+
+def dispatch_solvers(state, config):
+    mode = state.get("question_mode", "computation")
+    enabled = state.get("python_verification_enabled", python_verification_needed(state.get("problem", ""), mode))
+    targets = state.get("retry_targets") or (["reasoning", "python"] if enabled else ["reasoning"])
+    targets = [target for target in targets if target != "python" or enabled] or ["reasoning"]
+    sends = []
+    for target in targets:
+        if target == "reasoning":
+            sends.append(Send("reasoning_agent", {
+                **state, "branch_hint": state.get("reasoning_retry_hint"),
+            }))
+        elif target == "python":
+            sends.append(Send("python_agent", {
+                **state, "branch_hint": state.get("python_retry_hint"),
+                "objective_python_enabled": is_objective_mode(mode),
+            }))
+    return sends
+
 
 def build_solving_subgraph():
     sub = StateGraph(MathAgentState)
-    sub.add_node("database_retrieval", node_wrapper(database_retrieval_node, "database_retrieval"))
+    def prepare(state, config):
+        task = state.get("verification_task") or verification_task(state.get("problem", ""), state.get("question_mode", "computation"))
+        return {"python_verification_enabled": task["python_required"], "verification_task": task}
+    sub.add_node("dispatch", prepare)
     sub.add_node("reasoning_agent", node_wrapper(reasoning_agent_node, "reasoning_agent"))
     sub.add_node("python_agent", node_wrapper(python_agent_node, "python_agent"))
     sub.add_node("cross_validator", node_wrapper(cross_validator_node, "cross_validator"))
-
-    # 先检索题库
-    sub.add_edge(START, "database_retrieval")
-
-    def fan_out(state, config):
-        # 高相似题只作为完整例题参考，仍走正常推理和验证流程。
-        reasoning_send = Send(
-            "reasoning_agent", {**state, "branch_hint": state.get("reasoning_retry_hint")}
-        )
-        # 已有完整例题时，避免无关的 Python 启发式结果覆盖推理结论。
-        if any(isinstance(item, dict) and item.get("relation") == "high_similarity"
-               for item in (state.get("retrieved_examples") or [])):
-            return [reasoning_send]
-        if objective_needs_independent_python(
-                state.get("problem", ""), state.get("question_mode", "computation")):
-            # 客观题增加独立 Python 尝试，避免只凭格式接受答案。
-            return [
-                reasoning_send,
-                Send("python_agent", {
-                    **state,
-                    "branch_hint": state.get("python_retry_hint"),
-                    "objective_python_enabled": True,
-                }),
-            ]
-        return [
-            reasoning_send,
-            Send("python_agent", {**state, "branch_hint": state.get("python_retry_hint")}),
-        ]
-    sub.add_conditional_edges(
-        "database_retrieval", fan_out,
-        ["reasoning_agent", "python_agent"])
+    sub.add_edge(START, "dispatch")
+    sub.add_conditional_edges("dispatch", dispatch_solvers, ["reasoning_agent", "python_agent"])
     sub.add_edge("reasoning_agent", "cross_validator")
     sub.add_edge("python_agent", "cross_validator")
     sub.add_edge("cross_validator", END)

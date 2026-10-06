@@ -96,8 +96,8 @@ def is_placeholder_answer(text: str) -> bool:
     # → 是骨架不是答案。带真实内容的混合行（"[结论] x=3"）不受影响。
     if _TEMPLATE_TOKEN_RE.search(value):
         residue = _TEMPLATE_TOKEN_RE.sub("", value)
-        # 结构性标签（步骤N/关键步骤/验证点N）不是信息负载，一并剥掉再判。
-        residue = re.sub(r"(?:关键)?步骤\s*\d*|验证点\s*\d*|[：:（()）\[\]【】\s\-•|]+", " ", residue)
+        # 结构性步骤标签不是信息负载，剥掉后再判。
+        residue = re.sub(r"(?:关键)?步骤\s*\d*|[：:（()）\[\]【】\s\-•|]+", " ", residue)
         if not re.search(r"[0-9=]|\\[a-zA-Z]{2,}|[一-鿿]{2,}", residue):
             return True
     return False

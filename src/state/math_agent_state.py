@@ -5,6 +5,19 @@ from typing_extensions import NotRequired, TypedDict
 from utils.problem_anchor import make_problem_anchor
 from utils.problem_profile import classify_question_mode, mode_from_metadata
 
+
+def merge_node_timings(current: List[Dict], update: List[Dict]) -> List[Dict]:
+    """合并计时增量，并避免子图回传累计状态时重复追加旧记录。"""
+    current = list(current or [])
+    update = list(update or [])
+
+    # 普通节点只提交新增记录；子图完成时可能回传包含旧记录的完整列表。
+    # 只有回传列表比当前列表更长且以当前列表为前缀时，才只合并新增后缀。
+    if len(update) > len(current) and update[:len(current)] == current:
+        return current + update[len(current):]
+    return current + update
+
+
 class MathAgentState(TypedDict):
     # 输入阶段（必需）
     problem: str
@@ -25,11 +38,14 @@ class MathAgentState(TypedDict):
     alternate_categories: NotRequired[List[str]]
     # 数据库检索阶段
     retrieved_examples: NotRequired[List[Dict[str, Any]]]
+    # Legacy state may carry cards; no node reads or injects them.
     knowledge_cards: NotRequired[List[Dict[str, Any]]]
     retrieval_candidates: NotRequired[List[Dict[str, Any]]]
     retrieval_relation_summary: NotRequired[Dict[str, Any]]
     # 注入证据：两个子代理各自记录参考示例区块实际写入提示词的字符数。
     # 必须分键——两个代理并行写 state，同键并发写会被 LangGraph 拒绝。
+    reasoning_skill_cards: NotRequired[List[str]]
+    python_skill_cards: NotRequired[List[str]]
     reasoning_reference_chars: NotRequired[int]
     reasoning_knowledge_card_chars: NotRequired[int]
     python_reference_chars: NotRequired[int]
@@ -44,6 +60,12 @@ class MathAgentState(TypedDict):
     python_output: NotRequired[Optional[Dict[str, Any]]]
     python_trace: NotRequired[List[Dict]]
     python_retry_hint: NotRequired[Optional[str]]
+    python_verification_enabled: NotRequired[bool]
+    verification_task: NotRequired[Dict[str, Any]]
+    knowledge_review: NotRequired[Dict[str, Any]]
+    retry_targets: NotRequired[List[str]]
+    candidate_health: NotRequired[Dict[str, bool]]
+    submission_check: NotRequired[Dict[str, Any]]
     python_evidence_status: NotRequired[str]
     python_evidence_summary: NotRequired[str]
     python_contradictions: NotRequired[List[str]]
@@ -66,7 +88,7 @@ class MathAgentState(TypedDict):
     # 输出阶段
     final_response: NotRequired[str]
     coordination_detail: NotRequired[Optional[str]]  # coordinator 原始解题说明，记入 trace（计算题 final_response 已收敛为简洁答案）
-    coordination_vote_summary: NotRequired[Dict[str, Any]]
+    coordination_summary: NotRequired[Dict[str, Any]]
     fallback_source: NotRequired[str]
     # 内部控制
     branch_hint: NotRequired[Optional[str]]  # Send() 扇出携带的重试提示（solving 子图内）
@@ -75,7 +97,7 @@ class MathAgentState(TypedDict):
     token_budget_consumed: NotRequired[int]
     # 各节点实测耗时。必须是 reducer 字段：solving 子图内 reasoning_agent 与
     # python_agent 并行扇出，两条分支会同时写入。
-    node_timings: NotRequired[Annotated[List[Dict], operator.add]]
+    node_timings: NotRequired[Annotated[List[Dict], merge_node_timings]]
 
 def create_initial_state(problem: str, metadata: Dict[str, Any]) -> MathAgentState:
     metadata = metadata if isinstance(metadata, dict) else {}

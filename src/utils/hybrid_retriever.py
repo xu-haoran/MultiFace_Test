@@ -221,7 +221,16 @@ class HybridRetriever:
                 "subject_match": bool(subject_bonus),
             }
 
-        return sorted(
+        ranked = sorted(
             merged.values(), key=lambda item: float(item.get("hybrid_score") or 0.0), reverse=True
-        )[:max(1, final_k)]
+        )
+        # Relation filtering consumes dense similarity, so lexical-only rows
+        # must not evict every candidate that can pass that filter. Reserve a
+        # slot for the best dense match; preserve all original scores.
+        selected = ranked[:max(1, final_k)]
+        if dense:
+            best = merged[str(dense[0]['record_id'])]
+            if best not in selected:
+                selected[-1] = best
+        return selected
 
