@@ -93,8 +93,8 @@ def database_retrieval_node(state: Dict[str, Any], config: Dict) -> Dict[str, An
         candidates = annotate_candidates(
             problem,
             raw_results,
-            high_similarity_min=float(CONFIG.get("db_high_similarity", 0.85)),
-            related_min_similarity=float(CONFIG.get("db_related_similarity", 0.70)),
+            high_similarity_min=float(CONFIG.get("db_high_similarity", 0.88)),
+            related_min_similarity=float(CONFIG.get("db_related_similarity", 0.75)),
         )
         examples = select_for_injection(
             candidates,
@@ -145,8 +145,8 @@ def database_retrieval_node(state: Dict[str, Any], config: Dict) -> Dict[str, An
             fallback_candidates = annotate_candidates(
                 problem,
                 raw_fallback,
-                high_similarity_min=float(CONFIG.get("db_high_similarity", 0.85)),
-                related_min_similarity=float(CONFIG.get("db_related_similarity", 0.70)),
+                high_similarity_min=float(CONFIG.get("db_high_similarity", 0.88)),
+                related_min_similarity=float(CONFIG.get("db_related_similarity", 0.75)),
             )
             fallback_examples = select_for_injection(
                 fallback_candidates,

@@ -104,8 +104,8 @@ class ReasoningAgent:
             }
             reasoning_chars = int(state.get("reasoning_reference_chars", 0) or 0)
             python_chars = int(state.get("python_reference_chars", 0) or 0)
-            high_threshold = float(CONFIG.get("db_high_similarity", 0.85))
-            related_threshold = float(CONFIG.get("db_related_similarity", 0.70))
+            high_threshold = float(CONFIG.get("db_high_similarity", 0.88))
+            related_threshold = float(CONFIG.get("db_related_similarity", 0.75))
             related_limit = int(CONFIG.get("db_related_inject_k", 3) or 3)
             trace.append({
                 "step": "database_retrieval",

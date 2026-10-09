@@ -117,7 +117,7 @@ def answer_reuse_safety(
     problem: str,
     candidate: Dict[str, Any],
     *,
-    high_similarity_min: float = 0.85,
+    high_similarity_min: float = 0.88,
 ) -> tuple[bool, str]:
     """Allow answer-bearing reuse only for an exact normalized prompt match."""
     if candidate.get("relation") != "high_similarity":
@@ -151,8 +151,8 @@ def classify_relation(
     candidate_problem: str,
     similarity: float,
     *,
-    high_similarity_min: float = 0.85,
-    related_min_similarity: float = 0.70,
+    high_similarity_min: float = 0.88,
+    related_min_similarity: float = 0.75,
 ) -> Dict[str, Any]:
     """Return high_similarity/related/irrelevant with evidence.
 
@@ -193,8 +193,8 @@ def annotate_candidates(
     problem: str,
     candidates: Iterable[Dict[str, Any]],
     *,
-    high_similarity_min: float = 0.85,
-    related_min_similarity: float = 0.70,
+    high_similarity_min: float = 0.88,
+    related_min_similarity: float = 0.75,
 ) -> list[Dict[str, Any]]:
     annotated = []
     for raw in candidates:

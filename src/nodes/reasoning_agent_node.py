@@ -386,7 +386,7 @@ def reasoning_agent_node(state, config):
     base_prompt += problem_constraints(problem)
     if high_similarity_context:
         base_prompt += (
-            "\n\n[高相似候选完整参考解] 检索区块因稠密相似度超过 0.85 展示了一条完整参考解，"
+            "\n\n[高相似候选完整参考解] 检索区块因稠密相似度超过 0.88 展示了一条完整参考解，"
             "不要求规范化题面完全一致。它不一定是同一道题；仅在该条另行标明答案复用门槛通过时，"
             "才可考虑复用答案，其他情况须针对当前题独立推导并核验。\n"
         )

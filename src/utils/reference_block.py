@@ -32,7 +32,7 @@ _HEADER = "\n\n参考示例（统一数学题库召回，已做结构关系检�
 _ANTI_ANCHOR_NOTE = """
 ⚠️ 这些记录由检索召回，必须区分以下两类：
 
-- **高度一致候选题（high_similarity）**：仅按稠密检索相似度严格大于 0.85 分档，不要求规范化题面完全一致；该等级会展示排名最高的一条完整参考记录。标签不等于确认同题，参考答案仍须结合当前题条件核验。
+- **高度一致候选题（high_similarity）**：仅按稠密检索相似度严格大于 0.88 分档，不要求规范化题面完全一致；该等级会展示排名最高的一条完整参考记录。标签不等于确认同题，参考答案仍须结合当前题条件核验。
 - **相似题目（related）**：仅表示题型或内容相似，不是已确认的同一道题；只供参考解题过程，不能复用其答案、结论或参数。
 
 答案安全门槛仍独立约束答案复用和数据库兜底，但不阻止 high_similarity 候选的完整参考解进入上下文。未通过门槛时必须把参考解当作近似案例，围绕当前题独立推导。
@@ -142,7 +142,7 @@ def build_reference_block(
         answer_safe, safety_reason = answer_reuse_safety(
             problem,
             example,
-            high_similarity_min=float(example.get("high_similarity_min", 0.85) or 0.85),
+            high_similarity_min=float(example.get("high_similarity_min", 0.88) or 0.88),
         )
         answer_safe = answer_safe and example.get("answer_safe") is True
         full_reference_visible = relation == "high_similarity"
@@ -155,8 +155,8 @@ def build_reference_block(
             ),
             "related": (
                 f"相似题目（不是已确认的同一道题；仅供参考解题过程；"
-                f"{float(example.get('related_min_similarity', 0.70)):.2f} "
-                f"< 稠密相似度 ≤ {float(example.get('high_similarity_min', 0.85)):.2f}）"
+                f"{float(example.get('related_min_similarity', 0.75)):.2f} "
+                f"< 稠密相似度 ≤ {float(example.get('high_similarity_min', 0.88)):.2f}）"
             ),
         }.get(relation, "关系未确认")
         parts.append(

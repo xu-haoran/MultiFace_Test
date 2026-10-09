@@ -30,7 +30,7 @@ _ANSWER_PATTERNS = (
 #: 低于此相似度的检索结果不足以支撑兜底——宁可给通用失败说明。
 MIN_SIMILARITY = 0.45
 
-HIGH_SIMILARITY_ANSWER_MIN = 0.85
+HIGH_SIMILARITY_ANSWER_MIN = 0.88
 
 
 #: 结论值之后常接的论证连接词——"The answer is 1/2 by pigeonhole" 里的 " by ..."
@@ -86,7 +86,7 @@ def db_fallback_answer(state: dict) -> tuple[str, float, str]:
         safe, _ = answer_reuse_safety(
             str((state or {}).get("problem") or ""),
             example,
-            high_similarity_min=float(example.get("high_similarity_min", 0.85) or 0.85),
+            high_similarity_min=float(example.get("high_similarity_min", 0.88) or 0.88),
         )
         if (str(example.get("relation") or "") != "high_similarity"
                 or example.get("answer_safe") is not True or not safe):

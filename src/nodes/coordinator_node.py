@@ -132,7 +132,7 @@ def _database_reference_block(state: dict, limit: int = 2) -> str:
         answer_safe, _ = answer_reuse_safety(
             str((state or {}).get("problem") or ""),
             example,
-            high_similarity_min=float(example.get("high_similarity_min", 0.85) or 0.85),
+            high_similarity_min=float(example.get("high_similarity_min", 0.88) or 0.88),
         )
         high_similarity = relation == "high_similarity"
         answer_reuse_safe = example.get("answer_safe") is True and answer_safe
